@@ -36,6 +36,12 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
 MAX_FILE_SIZE = 49 * 1024 * 1024  # Telegram Bot API upload limit is 50 MB
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+
+# On hosts like Railway you can't upload files easily — pass cookies as an
+# env var instead and we materialize the file at startup.
+_cookies_content = os.environ.get("COOKIES_CONTENT", "").strip()
+if _cookies_content and not Path(COOKIES_FILE).exists():
+    Path(COOKIES_FILE).write_text(_cookies_content, encoding="utf-8")
 BASE_WORK_DIR = Path(tempfile.gettempdir()) / "tg-downloader-bot"
 
 URL_RE = re.compile(r"https?://[^\s<>'\"]+")
@@ -103,7 +109,7 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return False
 
 WELCOME = """
-👋 سلام! به ربات دانلودر Netora خوش اومدی
+👋 سلام! به ربات دانلودر خوش اومدی
 
 فقط کافیه لینک رو بفرستی، بقیه‌ش با من ⚡
 
@@ -178,7 +184,6 @@ def download(url: str, workdir: Path, status_message, loop,
         "outtmpl": str(workdir / "%(title).100s-%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
         "restrictfilenames": True,
         "socket_timeout": 30,
         "retries": 3,
@@ -186,6 +191,14 @@ def download(url: str, workdir: Path, status_message, loop,
         "writesubtitles": False,
         "progress_hooks": [make_progress_hook(loop, status_message, {})],
     }
+    # A TikTok photo post or IG carousel IS a playlist — download all items.
+    # For YouTube keep the single video only, even if the URL has &list=.
+    if detect_platform(url) == "youtube":
+        opts["noplaylist"] = True
+    else:
+        opts["noplaylist"] = False
+        opts["playlistend"] = 10
+        opts["ignoreerrors"] = True
     if audio:
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
@@ -317,12 +330,21 @@ async def process_download(message, url: str,
 
     except Exception as exc:
         logger.exception("Download failed: %s", url)
+        reason = re.sub(r"^ERROR:\s*", "", str(exc)).replace(url, "").strip()
+        if len(reason) > 250:
+            reason = reason[:250] + "…"
         hint = ""
-        if "instagram" in url:
-            hint = "\n\n💡 بعضی پست‌های اینستاگرام نیاز به لاگین دارن (پست خصوصی یا محدودیت سنی)."
+        if "sign in" in reason.lower() or "login" in reason.lower():
+            hint = (
+                "\n\n💡 یوتیوب/اینستاگرام IP سرور رو بلاک کرده. "
+                "راه‌حل: فایل کوکی مرورگرت رو در متغیر COOKIES_CONTENT روی "
+                "Railway ست کن (راهنما توی README)."
+            )
+        elif "instagram" in url:
+            hint = "\n\n💡 بعضی پست‌های اینستاگرام نیاز به لاگین دارن — کوکی لازمه."
         await safe_edit(
             status,
-            "❌ متأسفانه دانلود نشد. لینک رو چک کن و دوباره امتحان کن." + hint,
+            f"❌ دانلود نشد.\n\n🛠 دلیل:\n{reason or 'خطای ناشناخته'}{hint}",
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
