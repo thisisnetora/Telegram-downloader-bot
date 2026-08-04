@@ -1,6 +1,7 @@
 """Telegram downloader bot — YouTube, Instagram, TikTok, Pinterest."""
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -59,6 +60,14 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 pending: dict[str, str] = {}
 download_sem = asyncio.Semaphore(3)
+stats = {"total": 0}
+
+PLATFORM_META = {
+    "youtube": ("📺", "یوتیوب"),
+    "instagram": ("📸", "اینستاگرام"),
+    "tiktok": ("🎵", "تیک‌تاک"),
+    "pinterest": ("📌", "پینترست"),
+}
 
 JOIN_REQUIRED = (
     "🔒 برای استفاده از ربات، اول باید عضو کانال ما بشی.\n\n"
@@ -109,16 +118,23 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return False
 
 WELCOME = """
-👋 سلام! به ربات دانلودر خوش اومدی
+✨ <b>به ربات دانلودر خوش اومدی!</b>
 
-فقط کافیه لینک رو بفرستی، بقیه‌ش با من ⚡
+لینک بفرست، تحویل بگیر — همین‌قدر ساده ⚡
 
-📺 <b>یوتیوب</b> — ویدیو با کیفیت دلخواه یا MP3
-📸 <b>اینستاگرام</b> — ریلز، پست و IGTV
-🎵 <b>تیک‌تاک</b> — ویدیو و عکس
-📌 <b>پینترست</b> — ویدیو و عکس
+📺 <b>یوتیوب</b>
+└ کیفیت ۱۰۸۰ تا ۳۶۰ + 🎧 MP3 با کارت اطلاعات ویدیو
 
-/help برای راهنما
+📸 <b>اینستاگرام</b>
+└ ریلز، پست ویدیویی و کاروسل
+
+🎵 <b>تیک‌تاک</b>
+└ ویدیو و آلبوم عکس
+
+📌 <b>پینترست</b>
+└ ویدیو و عکس HD
+
+🚀 برای شروع، همین حالا یک لینک بفرست!
 """
 
 HELP = """
@@ -128,10 +144,14 @@ HELP = """
 ۲. همین‌جا بفرست
 ۳. چند لحظه صبر کن تا فایل برسه ⏳
 
+✨ <b>قابلیت‌ها:</b>
+• یوتیوب: کارت اطلاعات ویدیو + انتخاب کیفیت + MP3
+• تیک‌تاک و اینستا: دانلود خودکار، حتی پست‌های چندعکسی
+• نمایش عنوان، مدت و حجم فایل روی هر دانلود
+
 💡 <b>نکته‌ها:</b>
-• برای یوتیوب می‌تونی کیفیت یا MP3 انتخاب کنی
 • حداکثر حجم فایل: ۵۰ مگابایت (محدودیت تلگرام)
-• اگر ویدیوی یوتیوب حجیم بود، کیفیت پایین‌تر رو امتحان کن
+• اگر ویدیوی یوتیوب حجیم بود، کیفیت پایین‌تر یا MP3 رو انتخاب کن
 """
 
 
@@ -140,6 +160,41 @@ def detect_platform(url: str):
         if pattern.search(url):
             return name
     return None
+
+
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def fa(text) -> str:
+    return str(text).translate(_FA_DIGITS)
+
+
+def fmt_duration(seconds) -> str:
+    if not seconds:
+        return ""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    out = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    return fa(out)
+
+
+def fmt_size(num_bytes: float) -> str:
+    mb = num_bytes / 1024 / 1024
+    if mb >= 1024:
+        return f"{fa(f'{mb / 1024:.1f}')} گیگابایت"
+    if mb >= 1:
+        return f"{fa(f'{mb:.0f}')} مگابایت"
+    return f"{fa(f'{num_bytes / 1024:.0f}')} کیلوبایت"
+
+
+def fmt_views(count) -> str:
+    if not count:
+        return ""
+    if count >= 1_000_000:
+        return f"{fa(f'{count / 1_000_000:.1f}')} میلیون بازدید"
+    if count >= 1_000:
+        return f"{fa(f'{count / 1_000:.0f}')} هزار بازدید"
+    return f"{fa(count)} بازدید"
 
 
 def progress_bar(pct: float) -> str:
@@ -178,8 +233,27 @@ def make_progress_hook(loop, status_message, state):
     return hook
 
 
+def _cookies_opts(opts: dict) -> dict:
+    if Path(COOKIES_FILE).exists():
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def extract_metadata(url: str):
+    """Fetch title/thumbnail/etc. without downloading anything."""
+    opts = _cookies_opts({
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
 def download(url: str, workdir: Path, status_message, loop,
-             quality: int | None = None, audio: bool = False) -> list[Path]:
+             quality: int | None = None, audio: bool = False) -> tuple[list[Path], dict]:
     opts = {
         "outtmpl": str(workdir / "%(title).100s-%(id)s.%(ext)s"),
         "quiet": True,
@@ -221,16 +295,16 @@ def download(url: str, workdir: Path, status_message, loop,
         )
         opts["merge_output_format"] = "mp4"
 
-    if Path(COOKIES_FILE).exists():
-        opts["cookiefile"] = COOKIES_FILE
+    _cookies_opts(opts)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
+        info = ydl.extract_info(url, download=True)
 
-    return sorted(
+    files = sorted(
         (p for p in workdir.iterdir() if p.is_file()),
         key=lambda p: p.stat().st_mtime,
     )
+    return files, (info or {})
 
 
 def fetch_og_image(url: str):
@@ -254,7 +328,28 @@ def fetch_og_image(url: str):
     return None
 
 
-async def deliver(message, files: list[Path], caption: str = ""):
+def build_caption(info: dict, url: str, size: int, bot_username: str) -> str:
+    emoji, label = PLATFORM_META.get(detect_platform(url) or "", ("🔗", "لینک"))
+    title = (info.get("title") or info.get("description") or "").strip()
+    title = html.escape(re.sub(r"\s+", " ", title)[:120])
+
+    lines = []
+    if title:
+        lines.append(f"🎬 <b>{title}</b>\n")
+    parts = [f"{emoji} {label}"]
+    if info.get("duration"):
+        parts.append(f"⏱ {fmt_duration(info['duration'])}")
+    if size:
+        parts.append(f"📦 {fmt_size(size)}")
+    lines.append("  •  ".join(parts))
+    footer = f"🤖 @{bot_username}" if bot_username else ""
+    if footer:
+        lines.append(f"\n{footer}")
+    return "\n".join(lines)
+
+
+async def deliver(message, files: list[Path], caption: str = "",
+                  thumbnail=None, title: str | None = None):
     images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
     others = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
 
@@ -267,28 +362,35 @@ async def deliver(message, files: list[Path], caption: str = ""):
             finally:
                 for h in handles:
                     h.close()
+        if caption:
+            await message.reply_text(caption, parse_mode="HTML")
     elif images:
         with open(images[0], "rb") as fh:
-            await message.reply_photo(fh, caption=caption)
+            await message.reply_photo(fh, caption=caption, parse_mode="HTML")
 
     for f in others:
         ext = f.suffix.lower()
         with open(f, "rb") as fh:
             if ext in VIDEO_EXTS:
                 await message.reply_video(
-                    fh, caption=caption, supports_streaming=True
+                    fh, caption=caption, parse_mode="HTML",
+                    supports_streaming=True, thumbnail=thumbnail,
                 )
             elif ext in AUDIO_EXTS:
-                await message.reply_audio(fh, caption=caption)
+                await message.reply_audio(
+                    fh, caption=caption, parse_mode="HTML",
+                    thumbnail=thumbnail, title=title,
+                )
             else:
-                await message.reply_document(fh, caption=caption)
+                await message.reply_document(fh, caption=caption, parse_mode="HTML")
 
 
 async def process_download(message, url: str,
                            quality: int | None = None, audio: bool = False,
                            status_message=None):
     chat = message.chat
-    status = status_message or await message.reply_text("⏳ در حال آماده‌سازی...")
+    emoji, label = PLATFORM_META.get(detect_platform(url) or "", ("🔗", "لینک"))
+    status = status_message or await message.reply_text(f"{emoji} لینک {label} دریافت شد...")
     workdir = BASE_WORK_DIR / uuid.uuid4().hex[:12]
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -297,8 +399,8 @@ async def process_download(message, url: str,
         loop = asyncio.get_running_loop()
 
         async with download_sem:
-            await safe_edit(status, "⬇️ در حال دانلود...")
-            files = await asyncio.to_thread(
+            await safe_edit(status, f"⬇️ در حال دانلود از {label}...")
+            files, info = await asyncio.to_thread(
                 download, url, workdir, status, loop, quality, audio
             )
 
@@ -307,17 +409,20 @@ async def process_download(message, url: str,
             image_url = await asyncio.to_thread(fetch_og_image, url)
             if image_url:
                 await status.delete()
-                await message.reply_photo(image_url)
+                stats["total"] += 1
+                await message.reply_photo(
+                    image_url,
+                    caption=f"{emoji} {label}  •  🖼 عکس\n\n🤖 @{message.get_bot().username}",
+                )
                 return
             raise RuntimeError("nothing downloaded")
 
         ok = [f for f in files if f.stat().st_size <= MAX_FILE_SIZE]
         if not ok:
-            size_mb = max(f.stat().st_size for f in files) / 1024 / 1024
             await safe_edit(
                 status,
-                f"⚠️ حجم فایل {size_mb:.0f} مگابایته و از محدودیت ۵۰ مگابایت "
-                f"تلگرام بیشتره.\n\n"
+                f"⚠️ حجم فایل {fmt_size(max(f.stat().st_size for f in files))}ه "
+                f"و از محدودیت ۵۰ مگابایت تلگرام بیشتره.\n\n"
                 f"💡 برای یوتیوب: لینک رو دوباره بفرست و کیفیت پایین‌تر "
                 f"یا MP3 رو انتخاب کن.",
             )
@@ -325,7 +430,14 @@ async def process_download(message, url: str,
 
         await safe_edit(status, "📤 در حال آپلود به تلگرام...")
         await chat.send_action(ChatAction.UPLOAD_VIDEO)
-        await deliver(message, ok)
+        stats["total"] += 1
+        total_size = sum(f.stat().st_size for f in ok)
+        caption = build_caption(info, url, total_size, message.get_bot().username)
+        caption += f"\n🔢 دانلود شماره {fa(stats['total'])}"
+        await deliver(
+            message, ok, caption=caption,
+            thumbnail=info.get("thumbnail"), title=info.get("title"),
+        )
         await status.delete()
 
     except Exception as exc:
@@ -375,22 +487,64 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     platform = detect_platform(url)
 
     if platform == "youtube":
-        token = uuid.uuid4().hex[:8]
-        pending[token] = url
-        keyboard = [
-            [
-                InlineKeyboardButton("📺 720p", callback_data=f"yt:720:{token}"),
-                InlineKeyboardButton("📺 480p", callback_data=f"yt:480:{token}"),
-                InlineKeyboardButton("📺 360p", callback_data=f"yt:360:{token}"),
-            ],
-            [InlineKeyboardButton("🎵 MP3 (فقط صوت)", callback_data=f"yt:mp3:{token}")],
-        ]
-        await update.message.reply_text(
-            "🎬 لینک یوتیوب دریافت شد!\nکیفیت رو انتخاب کن:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        await send_youtube_card(update.message, url)
     else:
         await process_download(update.message, url)
+
+
+def youtube_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 ۱۰۸۰", callback_data=f"yt:1080:{token}"),
+            InlineKeyboardButton("🎬 ۷۲۰", callback_data=f"yt:720:{token}"),
+            InlineKeyboardButton("🎬 ۴۸۰", callback_data=f"yt:480:{token}"),
+            InlineKeyboardButton("🎬 ۳۶۰", callback_data=f"yt:360:{token}"),
+        ],
+        [InlineKeyboardButton("🎧 MP3 — فقط صوت", callback_data=f"yt:mp3:{token}")],
+    ])
+
+
+async def send_youtube_card(message, url: str):
+    token = uuid.uuid4().hex[:8]
+    pending[token] = url
+    keyboard = youtube_keyboard(token)
+
+    status = await message.reply_text("🔎 در حال دریافت اطلاعات ویدیو...")
+    try:
+        info = await asyncio.to_thread(extract_metadata, url)
+    except Exception:
+        # Metadata is a bonus — if it's blocked, still offer the buttons.
+        await safe_edit(
+            status,
+            "🎬 لینک یوتیوب دریافت شد!\n\n👇 کیفیت موردنظرت رو انتخاب کن:",
+        )
+        await status.edit_reply_markup(reply_markup=keyboard)
+        return
+
+    title = html.escape((info.get("title") or "ویدیوی یوتیوب")[:150])
+    card = f"🎬 <b>{title}</b>\n\n"
+    details = []
+    if info.get("uploader"):
+        details.append(f"👤 {html.escape(info['uploader'])}")
+    if info.get("duration"):
+        details.append(f"⏱ {fmt_duration(info['duration'])}")
+    if info.get("view_count"):
+        details.append(f"👁 {fmt_views(info['view_count'])}")
+    if details:
+        card += "   ".join(details) + "\n\n"
+    card += "👇 کیفیت موردنظرت رو انتخاب کن:"
+
+    thumbnail = info.get("thumbnail")
+    await status.delete()
+    if thumbnail:
+        try:
+            await message.reply_photo(
+                thumbnail, caption=card, parse_mode="HTML", reply_markup=keyboard
+            )
+            return
+        except Exception:
+            pass
+    await message.reply_text(card, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,14 +559,22 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = pending.pop(token, None)
     if not url:
-        await safe_edit(query.message, "⌛ این درخواست منقضی شده. لینک رو دوباره بفرست.")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "⌛ این درخواست منقضی شده. لینک رو دوباره بفرست."
+        )
         return
+
+    # The card message may be a photo — remove buttons, then let
+    # process_download create its own fresh status message.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     audio = q == "mp3"
     quality = None if audio else int(q)
-    await process_download(
-        query.message, url, quality=quality, audio=audio, status_message=query.message
-    )
+    await process_download(query.message, url, quality=quality, audio=audio)
 
 
 async def on_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
