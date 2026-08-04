@@ -37,6 +37,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
 MAX_FILE_SIZE = 49 * 1024 * 1024  # Telegram Bot API upload limit is 50 MB
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+# YouTube client spoofing order — some clients skip the bot-check on
+# datacenter IPs, some don't. Configurable because YouTube changes constantly.
+YOUTUBE_CLIENTS = [
+    c.strip()
+    for c in os.environ.get(
+        "YOUTUBE_CLIENTS", "android_vr,web_embedded,tv,web"
+    ).split(",")
+    if c.strip()
+]
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup.
@@ -236,6 +245,8 @@ def make_progress_hook(loop, status_message, state):
 def _cookies_opts(opts: dict) -> dict:
     if Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
+    if YOUTUBE_CLIENTS:
+        opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_CLIENTS}}
     return opts
 
 
