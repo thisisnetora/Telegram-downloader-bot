@@ -35,24 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")  # brand name shown in texts & captions
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
 # Official Bot API is capped at 50 MB. Point BOT_API_URL at a self-hosted
 # telegram-bot-api server (runs in --local mode) to raise it to ~2000 MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").strip().rstrip("/")
-if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
-    BOT_API_URL = "http://" + BOT_API_URL
-if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
-    BOT_API_URL = "http://" + BOT_API_URL
 if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
     BOT_API_URL = f"http://{BOT_API_URL}"
 try:
@@ -60,8 +47,6 @@ try:
 except ValueError:
     MAX_FILE_SIZE = 49 * 1024 * 1024
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup. Base64 is the
@@ -70,7 +55,7 @@ _cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
 _cookies_content = os.environ.get("COOKIES_CONTENT", "").strip()
 if _cookies_b64 and not Path(COOKIES_FILE).exists():
     try:
-        Path(COOKIES_FILE).write_bytes(base64.b64decode(_b64))
+        Path(COOKIES_FILE).write_bytes(base64.b64decode(_cookies_b64))
     except Exception:
         logger.exception("COOKIES_B64 is not valid base64")
 elif _cookies_content and not Path(COOKIES_FILE).exists():
@@ -294,9 +279,25 @@ def extract_metadata(url: str):
         return ydl.extract_info(url, download=False)
 
 
+def _format_string(quality: int | None, audio: bool) -> str:
+    """Build a flexible format selector — no hard ext=mp4/m4a restriction,
+    so we don't accidentally throw away every available format on clients
+    that only expose webm/opus streams."""
+    if audio:
+        return "bestaudio/best"
+    if quality:
+        return (
+            f"bv*[height<={quality}]+ba/"
+            f"b[height<={quality}]/"
+            f"bv*+ba/"
+            f"b"
+        )
+    return "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+
+
 def download(url: str, workdir: Path, status_message, loop,
              quality: int | None = None, audio: bool = False) -> tuple[list[Path], dict]:
-    opts = {
+    base_opts = {
         "outtmpl": str(workdir / "%(title).100s-%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -306,56 +307,66 @@ def download(url: str, workdir: Path, status_message, loop,
         "writethumbnail": False,
         "writesubtitles": False,
         "progress_hooks": [make_progress_hook(loop, status_message, {})],
-        # YouTube's default web client now returns PO-token-gated formats on
-        # datacenter IPs — these clients still serve plain downloadable ones.
-        "extractor_args": {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
+        "format": _format_string(quality, audio),
     }
     # A TikTok photo post or IG carousel IS a playlist — download all items.
     # For YouTube keep the single video only, even if the URL has &list=.
     if detect_platform(url) == "youtube":
-        opts["noplaylist"] = True
+        base_opts["noplaylist"] = True
     else:
-        opts["noplaylist"] = False
-        opts["playlistend"] = 10
+        base_opts["noplaylist"] = False
+        base_opts["playlistend"] = 10
         # Skip failed downloads inside carousels, but still surface
         # extraction errors (login required, no video, ...) to the user.
-        opts["ignoreerrors"] = "only_download"
+        base_opts["ignoreerrors"] = "only_download"
+
     if audio:
-        opts["format"] = "bestaudio/best"
-        opts["postprocessors"] = [{
+        base_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-    elif quality:
-        opts["format"] = (
-            f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={quality}]+bestaudio/"
-            f"best[height<={quality}]/"
-            f"bestvideo+bestaudio/"
-            f"best"
-        )
-        opts["merge_output_format"] = "mp4"
     else:
-        opts["format"] = (
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=1080]+bestaudio/"
-            "best[ext=mp4]/"
-            "bestvideo+bestaudio/"
-            "best"
-        )
-        opts["merge_output_format"] = "mp4"
+        base_opts["merge_output_format"] = "mp4"
 
-    _cookies_opts(opts)
+    _cookies_opts(base_opts)
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    # YouTube's player clients rotate in and out of PO-token gating.
+    # Try a few client sets in order and fall back to yt-dlp's own default
+    # (no extractor_args) if none of them expose a usable format — that
+    # default is what actually gets updated to dodge PO-token issues.
+    if detect_platform(url) == "youtube":
+        client_attempts = [
+            {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
+            {"youtube": {"player_client": ["web", "mweb", "tv"]}},
+            None,
+        ]
+    else:
+        client_attempts = [None]
 
-    files = sorted(
-        (p for p in workdir.iterdir() if p.is_file()),
-        key=lambda p: p.stat().st_mtime,
-    )
-    return files, (info or {})
+    last_exc = None
+    for extractor_args in client_attempts:
+        opts = dict(base_opts)
+        if extractor_args:
+            opts["extractor_args"] = extractor_args
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            files = sorted(
+                (p for p in workdir.iterdir() if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if files:
+                return files, (info or {})
+        except yt_dlp.utils.DownloadError as exc:
+            last_exc = exc
+            if "requested format is not available" in str(exc).lower():
+                continue  # try the next client set
+            raise  # any other error should surface immediately
+
+    if last_exc:
+        raise last_exc
+    return [], {}
 
 
 def fetch_og_image(url: str):
