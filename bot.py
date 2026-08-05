@@ -38,6 +38,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
@@ -287,6 +288,7 @@ def extract_metadata(url: str):
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": 20,
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
     })
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -304,6 +306,9 @@ def download(url: str, workdir: Path, status_message, loop,
         "writethumbnail": False,
         "writesubtitles": False,
         "progress_hooks": [make_progress_hook(loop, status_message, {})],
+        # YouTube's default web client now returns PO-token-gated formats on
+        # datacenter IPs — these clients still serve plain downloadable ones.
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
     }
     # A TikTok photo post or IG carousel IS a playlist — download all items.
     # For YouTube keep the single video only, even if the URL has &list=.
