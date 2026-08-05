@@ -138,8 +138,7 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return False
 
 WELCOME = """
-✨ <b> به ربات دانلودر Netora  خوش اومدی!</b>
-
+✨ <b>به ربات دانلودرNetora  خوش اومدی!</b>
 لینک بفرست، تحویل بگیر — همین‌قدر ساده ⚡
 
 📺 <b>یوتیوب</b>
