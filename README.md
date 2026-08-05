@@ -88,4 +88,27 @@ python bot.py
 | `FORCE_JOIN_CHANNEL` | — | یوزرنیم کانال برای جوین اجباری، مثلاً `@mychannel` |
 | `FORCE_JOIN_LINK` | — | (اختیاری) لینک دعوت — برای کانال خصوصی |
 | `COOKIES_CONTENT` | — | محتوای فایل کوکی (Netscape format) — روش پیشنهادی روی Railway |
+| `COOKIES_B64` | — | کوکی به‌صورت base64 (ضدخرابکاری — جایگزین COOKIES_CONTENT) |
 | `COOKIES_FILE` | `cookies.txt` | مسیر فایل کوکی (برای اجرای لوکال) |
+| `BOT_API_URL` | — | آدرس سرور Bot API محلی برای آپلود تا ~۲ گیگابایت |
+| `MAX_FILE_MB` | `49` | سقف حجم فایل به مگابایت |
+
+## 📦 آپلود فایل‌های بیشتر از ۵۰ مگابایت (تا ~۲ گیگابایت)
+
+API رسمی تلگرام سقف ۵۰ مگ داره. برای بیشتر، یک سرویس دوم روی Railway با
+ایمیج رسمی `telegram-bot-api` بالا میاری:
+
+1. از [my.telegram.org](https://my.telegram.org) → **API development tools** یک اپ بساز و `API_ID` و `API_HASH` رو بگیر
+2. توی Railway روی پروژه‌ت: **+ Create → Docker Image** → ایمیج: `aiogram/telegram-bot-api:latest`
+3. **Custom Start Command** این سرویس:
+   ```
+   telegram-bot-api --api-id=API_ID --api-hash=API_HASH --local --http-port=8081
+   ```
+   (مقادیر واقعی رو جایگزین کن)
+4. توی تنظیمات همین سرویس، **Private Networking** رو فعال کن
+5. توی سرویس ربات این متغیرها رو بساز:
+   - `BOT_API_URL` = `http://<نام-سرویس>.railway.internal:8081`
+   - `MAX_FILE_MB` = `1000`
+6. Redeploy
+
+> ⚠️ نکته: فایل‌های خیلی بزرگ روی پلن رایگان Railway ممکنه به محدودیت RAM/دیسک بخورن.

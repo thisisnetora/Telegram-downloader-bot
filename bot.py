@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
-MAX_FILE_SIZE = 49 * 1024 * 1024  # Telegram Bot API upload limit is 50 MB
+# Official Bot API is capped at 50 MB. Point BOT_API_URL at a self-hosted
+# telegram-bot-api server (runs in --local mode) to raise it to ~2000 MB.
+BOT_API_URL = os.environ.get("BOT_API_URL", "").strip().rstrip("/")
+MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "49")) * 1024 * 1024
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
@@ -478,7 +481,7 @@ async def process_download(message, url: str,
             await safe_edit(
                 status,
                 f"⚠️ حجم فایل {fmt_size(max(f.stat().st_size for f in files))}ه "
-                f"و از محدودیت ۵۰ مگابایت تلگرام بیشتره.\n\n"
+                f"و از سقف مجاز ({fmt_size(MAX_FILE_SIZE)}) بیشتره.\n\n"
                 f"💡 برای یوتیوب: لینک رو دوباره بفرست و کیفیت پایین‌تر "
                 f"یا MP3 رو انتخاب کن.",
             )
@@ -665,7 +668,19 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده!")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if BOT_API_URL:
+        builder = (
+            builder
+            .base_url(f"{BOT_API_URL}/bot")
+            .base_file_url(f"{BOT_API_URL}/file/bot")
+            .read_timeout(600)
+            .write_timeout(600)
+            .connect_timeout(60)
+        )
+        logger.info("Using local Bot API server at %s (max upload %d MB)",
+                    BOT_API_URL, MAX_FILE_SIZE // 1024 // 1024)
+    app = builder.build()
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^yt:"))
