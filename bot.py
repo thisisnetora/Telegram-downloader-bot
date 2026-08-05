@@ -35,12 +35,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")  # brand name shown in texts & captions
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
 # Official Bot API is capped at 50 MB. Point BOT_API_URL at a self-hosted
 # telegram-bot-api server (runs in --local mode) to raise it to ~2000 MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").strip().rstrip("/")
-MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "49")) * 1024 * 1024
+if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
+    BOT_API_URL = "http://" + BOT_API_URL
+if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
+    BOT_API_URL = "http://" + BOT_API_URL
+if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
+    BOT_API_URL = f"http://{BOT_API_URL}"
+try:
+    MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "").strip() or "49") * 1024 * 1024
+except ValueError:
+    MAX_FILE_SIZE = 49 * 1024 * 1024
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup. Base64 is the
@@ -137,8 +157,8 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass  # query may already have been answered
     return False
 
-WELCOME = """
-✨ <b>به ربات دانلودر خوش اومدی!</b>
+WELCOME = f"""
+✨ <b>به {BOT_BRAND} خوش اومدی!</b>
 
 لینک بفرست، تحویل بگیر — همین‌قدر ساده ⚡
 
@@ -471,7 +491,7 @@ async def process_download(message, url: str,
                 stats["total"] += 1
                 await reply_image(
                     message, image_url,
-                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 @{message.get_bot().username}",
+                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 {BOT_BRAND} • @{message.get_bot().username}",
                 )
                 return
             raise RuntimeError("nothing downloaded")
@@ -510,7 +530,7 @@ async def process_download(message, url: str,
                 stats["total"] += 1
                 await reply_image(
                     message, image_url,
-                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 @{message.get_bot().username}",
+                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 {BOT_BRAND} • @{message.get_bot().username}",
                 )
                 return
 
