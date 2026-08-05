@@ -289,14 +289,18 @@ def download(url: str, workdir: Path, status_message, loop,
         opts["format"] = (
             f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={quality}]+bestaudio/"
-            f"best[height<={quality}]/best"
+            f"best[height<={quality}]/"
+            f"bestvideo+bestaudio/"
+            f"best"
         )
         opts["merge_output_format"] = "mp4"
     else:
         opts["format"] = (
             "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
             "bestvideo[height<=1080]+bestaudio/"
-            "best[ext=mp4]/best"
+            "best[ext=mp4]/"
+            "bestvideo+bestaudio/"
+            "best"
         )
         opts["merge_output_format"] = "mp4"
 
