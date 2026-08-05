@@ -1,6 +1,7 @@
 """Telegram downloader bot — YouTube, Instagram, TikTok, Pinterest."""
 
 import asyncio
+import atexit
 import base64
 import html
 import json
@@ -8,6 +9,8 @@ import logging
 import os
 import re
 import shutil
+import socket
+import subprocess
 import tempfile
 import time
 import uuid
@@ -371,16 +374,83 @@ YT_CLIENTS_COOKIE = ["web", "mweb", "web_safari"]
 YT_CLIENTS_NOAUTH = ["android_vr", "android", "tv"]
 # bgutil PO-token provider (built into the Docker image): generates the tokens
 # YouTube's web clients demand, which is what unlocks the formats behind
-# "Requested format is not available". Optional — absent locally, it's skipped.
+# "Requested format is not available". We run it as an in-process HTTP server
+# (the project's recommended mode — cached, no per-call process spawn, and it
+# keeps the plugin on the Node build instead of a Deno runtime that re-downloads
+# its whole dependency tree on first use). Optional — absent locally, it's skipped.
 BGUTIL_SERVER_HOME = os.environ.get(
     "BGUTIL_SERVER_HOME", "/opt/bgutil-ytdlp-pot-provider/server"
 )
+BGUTIL_MAIN_JS = Path(BGUTIL_SERVER_HOME, "build", "main.js")
+POT_PORT = 4416
+POT_BASE_URL = f"http://127.0.0.1:{POT_PORT}"
+_pot_proc = None
+_pot_ready = False
+
+
+def _pot_server_available() -> bool:
+    return shutil.which("node") is not None and BGUTIL_MAIN_JS.exists()
+
+
+def start_pot_server() -> None:
+    """Launch the bgutil POT HTTP server in the background and wait until it's
+    actually listening. No-op when node or the built server isn't present
+    (local dev) so YouTube just falls back to cookie-less/token-less clients."""
+    global _pot_proc, _pot_ready
+    if _pot_ready or not _pot_server_available():
+        if not _pot_server_available():
+            logger.info("bgutil POT server not present (node/build missing) — skipping")
+        return
+    try:
+        # NOTE: the bgutil server only accepts --port; passing --host makes
+        # commander reject the args and the process exits before ever binding.
+        _pot_proc = subprocess.Popen(
+            ["node", str(BGUTIL_MAIN_JS), "--port", str(POT_PORT)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        logger.exception("Could not launch bgutil POT server")
+        _pot_proc = None
+        return
+    for _ in range(40):  # up to ~20s for the server to bind
+        if _pot_reachable():
+            _pot_ready = True
+            logger.info("bgutil POT server up on %s (pid %s)", POT_BASE_URL, _pot_proc.pid)
+            return
+        if _pot_proc.poll() is not None:
+            logger.error("bgutil POT server exited early (code %s)", _pot_proc.returncode)
+            _pot_proc = None
+            return
+        time.sleep(0.5)
+    logger.error("bgutil POT server did not become ready in time")
+
+
+def _pot_reachable() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", POT_PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def pot_ok() -> bool:
+    """Cheap liveness check: server was started and the process is still alive."""
+    return _pot_ready and _pot_proc is not None and _pot_proc.poll() is None
+
+
+def _stop_pot_server() -> None:
+    if _pot_proc and _pot_proc.poll() is None:
+        _pot_proc.terminate()
+
+
+atexit.register(_stop_pot_server)
 
 
 def _yt_args(clients) -> dict:
     args = {"youtube": {"player_client": clients}}
-    if Path(BGUTIL_SERVER_HOME, "build", "generate_once.js").exists():
-        args["youtubepot-bgutilscript"] = {"server_home": [BGUTIL_SERVER_HOME]}
+    if pot_ok():
+        args["youtubepot-bgutilhttp"] = {"base_url": [POT_BASE_URL]}
     return args
 
 
@@ -1019,6 +1089,11 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده!")
 
+    # Bring up the bgutil PO-token server BEFORE polling starts — without it the
+    # youtubepot-bgutilhttp extractor arg is never added and YouTube's web
+    # clients fail with "Requested format is not available".
+    start_pot_server()
+
     builder = Application.builder().token(BOT_TOKEN)
     if BOT_API_URL:
         builder = (
@@ -1050,7 +1125,7 @@ def main():
     logger.info(
         "Bot is starting... (yt-dlp %s, PO-token provider: %s, cookies: %s)",
         yt_dlp.version.__version__,
-        "✅" if Path(BGUTIL_SERVER_HOME, "build", "generate_once.js").exists() else "❌",
+        "✅" if pot_ok() else "❌",
         "✅" if Path(COOKIES_FILE).exists() else "❌",
     )
     app.run_polling(drop_pending_updates=True)
