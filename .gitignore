@@ -3,3 +3,5 @@ __pycache__/
 .env
 cookies.txt
 downloads/
+bot_data.json
+bot_data.tmp

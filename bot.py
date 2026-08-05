@@ -3,12 +3,15 @@
 import asyncio
 import base64
 import html
+import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yt_dlp
@@ -21,6 +24,7 @@ from telegram import (
 from telegram.constants import ChatAction, ChatMemberStatus
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -91,7 +95,92 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 pending: dict[str, str] = {}
 download_sem = asyncio.Semaphore(3)
-stats = {"total": 0}
+
+# --- Admin panel & persistent stats -----------------------------------------
+ADMIN_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "").strip())
+    if x.isdigit()
+}
+DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
+# Day boundaries for "today" stats follow Iran time.
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+START_TIME = time.time()
+
+_DB_DEFAULT = {
+    "users": {},          # str(user_id) -> {name, username, first, last}
+    "total_downloads": 0,
+    "total_failed": 0,
+    "total_joins": 0,     # users who verified channel membership
+    "platforms": {},      # platform -> count
+    "daily": {},          # "YYYY-MM-DD" -> {downloads, failed, joins, new_users}
+}
+
+
+def _load_db() -> dict:
+    try:
+        data = json.loads(Path(DATA_FILE).read_text(encoding="utf-8"))
+        return {**_DB_DEFAULT, **data}
+    except Exception:
+        return dict(_DB_DEFAULT)
+
+
+db = _load_db()
+
+
+def save_db():
+    try:
+        tmp = Path(DATA_FILE).with_suffix(".tmp")
+        tmp.write_text(json.dumps(db, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(DATA_FILE)
+    except Exception:
+        logger.exception("Could not save stats db")
+
+
+def today_str() -> str:
+    return datetime.now(IRAN_TZ).date().isoformat()
+
+
+def _daily() -> dict:
+    return db["daily"].setdefault(today_str(), {
+        "downloads": 0, "failed": 0, "joins": 0, "new_users": 0,
+    })
+
+
+def track_user(user) -> None:
+    if not user:
+        return
+    uid = str(user.id)
+    now = datetime.now(IRAN_TZ).isoformat(timespec="seconds")
+    if uid not in db["users"]:
+        db["users"][uid] = {
+            "name": user.full_name or "",
+            "username": user.username or "",
+            "first": now,
+        }
+        _daily()["new_users"] += 1
+    db["users"][uid]["last"] = now
+    save_db()
+
+
+def track_download(platform: str | None) -> int:
+    db["total_downloads"] += 1
+    _daily()["downloads"] += 1
+    if platform:
+        db["platforms"][platform] = db["platforms"].get(platform, 0) + 1
+    save_db()
+    return db["total_downloads"]
+
+
+def track_failure() -> None:
+    db["total_failed"] += 1
+    _daily()["failed"] += 1
+    save_db()
+
+
+def track_join() -> None:
+    db["total_joins"] += 1
+    _daily()["joins"] += 1
+    save_db()
 
 PLATFORM_META = {
     "youtube": ("📺", "یوتیوب"),
@@ -144,6 +233,7 @@ async def is_member(bot, user_id: int) -> bool:
 
 
 async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    track_user(update.effective_user)
     if await is_member(context.bot, update.effective_user.id):
         return True
     if update.message:
@@ -523,7 +613,7 @@ async def process_download(message, url: str,
             image_url = await asyncio.to_thread(fetch_og_image, url)
             if image_url:
                 await status.delete()
-                stats["total"] += 1
+                track_download(detect_platform(url))
                 await reply_image(
                     message, image_url,
                     f"{emoji} {label}  •  🖼 عکس\n\n🤖 {BOT_BRAND} • @{message.get_bot().username}",
@@ -533,6 +623,7 @@ async def process_download(message, url: str,
 
         ok = [f for f in files if f.stat().st_size <= MAX_FILE_SIZE]
         if not ok:
+            track_failure()
             await safe_edit(
                 status,
                 f"⚠️ <b>فایل خیلی حجیمه!</b>\n\n"
@@ -545,10 +636,10 @@ async def process_download(message, url: str,
 
         await safe_edit(status, "📤 در حال آپلود به تلگرام...")
         await chat.send_action(ChatAction.UPLOAD_VIDEO)
-        stats["total"] += 1
+        download_no = track_download(detect_platform(url))
         total_size = sum(f.stat().st_size for f in ok)
         caption = build_caption(info, url, total_size, message.get_bot().username)
-        caption += f"\n🔢 دانلود شماره {fa(stats['total'])}"
+        caption += f"\n🔢 دانلود شماره {fa(download_no)}"
         await deliver(
             message, ok, caption=caption,
             thumbnail=info.get("thumbnail"), title=info.get("title"),
@@ -563,12 +654,13 @@ async def process_download(message, url: str,
             image_url = await asyncio.to_thread(fetch_og_image, url)
             if image_url:
                 await status.delete()
-                stats["total"] += 1
+                track_download(detect_platform(url))
                 await reply_image(
                     message, image_url,
                     f"{emoji} {label}  •  🖼 عکس\n\n🤖 {BOT_BRAND} • @{message.get_bot().username}",
                 )
                 return
+        track_failure()
 
         reason = re.sub(r"^ERROR:\s*", "", str(exc)).replace(url, "").strip()
         if len(reason) > 250:
@@ -728,7 +820,9 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    track_user(query.from_user)
     if await is_member(context.bot, query.from_user.id):
+        track_join()
         await query.answer("✅ عضویت تأیید شد!")
         await safe_edit(query.message, "✅ عضویتت تأیید شد! حالا لینک رو بفرست 🚀")
     else:
@@ -737,6 +831,126 @@ async def on_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error", exc_info=context.error)
+
+
+# --- Admin panel -------------------------------------------------------------
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin:refresh")],
+        [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="admin:broadcast")],
+        [InlineKeyboardButton("💾 بکاپ آمار", callback_data="admin:backup"),
+         InlineKeyboardButton("❌ بستن پنل", callback_data="admin:close")],
+    ])
+
+
+def admin_panel_text() -> str:
+    daily = db["daily"].get(today_str(), {})
+    lines = [
+        "🛠 <b>پنل مدیریت</b>\n",
+        f"👥 <b>کاربران:</b> {fa(len(db['users']))} نفر"
+        f"  (امروز: {fa(daily.get('new_users', 0))})",
+        f"⬇️ <b>دانلودها:</b> {fa(db['total_downloads'])}"
+        f"  (امروز: {fa(daily.get('downloads', 0))})",
+        f"❌ <b>ناموفق:</b> {fa(db['total_failed'])}"
+        f"  (امروز: {fa(daily.get('failed', 0))})",
+        f"✅ <b>عضویت کانال:</b> {fa(db['total_joins'])}"
+        f"  (امروز: {fa(daily.get('joins', 0))})",
+    ]
+    if db["platforms"]:
+        lines.append("\n📊 <b>دانلود بر اساس پلتفرم:</b>")
+        for key, (emoji, label) in PLATFORM_META.items():
+            if db["platforms"].get(key):
+                lines.append(f"{emoji} {label}: {fa(db['platforms'][key])}")
+    uptime = fmt_duration(time.time() - START_TIME)
+    lines.append(
+        f"\n⚙️ آپتایم: {uptime}  │  yt-dlp {yt_dlp.version.__version__}"
+        f"  │  کوکی: {'✅' if Path(COOKIES_FILE).exists() else '❌'}"
+    )
+    return "\n".join(lines)
+
+
+async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+    if update.effective_user.id not in ADMIN_IDS:
+        return  # silent — don't reveal the panel exists
+    await update.message.reply_text(
+        admin_panel_text(), parse_mode="HTML", reply_markup=admin_keyboard()
+    )
+
+
+async def on_admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("⛔ دسترسی نداری!", show_alert=True)
+        return
+    action = query.data.split(":")[1]
+    if action == "refresh":
+        await query.answer("🔄 بروز شد")
+        await safe_edit(query.message, admin_panel_text())
+    elif action == "broadcast":
+        context.user_data["awaiting_broadcast"] = True
+        await query.answer()
+        await query.message.reply_text(
+            "📢 پیام همگانی رو بفرست — متن، عکس، ویدیو... هر چی بفرستی "
+            "برای همه کاربران کپی می‌شه.\n\nبرای انصراف: /cancel"
+        )
+    elif action == "backup":
+        await query.answer()
+        path = Path(DATA_FILE)
+        if not path.exists():
+            await query.answer("⚠️ هنوز فایل آماری ساخته نشده.", show_alert=True)
+            return
+        with path.open("rb") as fh:
+            await query.message.reply_document(
+                document=fh,
+                filename="bot_data.json",
+                caption="💾 بکاپ آمار — برای انتقال به هاست جدید، این فایل رو "
+                        "توی مسیر DATA_FILE اونجا کپی کن و ربات رو ری‌استارت کن.",
+            )
+    elif action == "close":
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+
+async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop("awaiting_broadcast", False):
+        await update.message.reply_text("❌ ارسال همگانی لغو شد.")
+
+
+async def on_maybe_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in group -1, before the link handler. Consumes the admin's message
+    when a broadcast is pending so it isn't treated as a download link."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+    if not context.user_data.pop("awaiting_broadcast", False):
+        return
+    msg = update.effective_message
+    if not db["users"]:
+        await msg.reply_text("⚠️ هنوز هیچ کاربری ربات رو استارت نکرده.")
+        raise ApplicationHandlerStop
+    status = await msg.reply_text(f"📢 در حال ارسال به {fa(len(db['users']))} کاربر...")
+    ok = fail = 0
+    for uid in list(db["users"]):
+        try:
+            await context.bot.copy_message(
+                chat_id=int(uid), from_chat_id=msg.chat_id, message_id=msg.message_id
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)  # stay under Telegram rate limits
+    await safe_edit(
+        status,
+        f"📢 <b>ارسال همگانی تمام شد</b>\n\n"
+        f"✅ موفق: {fa(ok)}\n"
+        f"❌ ناموفق (بلاک/حذف ربات): {fa(fail)}",
+    )
+    raise ApplicationHandlerStop
 
 
 async def validate_force_join(app: Application):
@@ -784,9 +998,16 @@ def main():
     app.post_init = validate_force_join
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
+    app.add_handler(CommandHandler("admin", on_admin))
+    app.add_handler(CommandHandler("cancel", on_cancel))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^yt:"))
     app.add_handler(CallbackQueryHandler(on_join_check, pattern=r"^join:check$"))
+    app.add_handler(CallbackQueryHandler(on_admin_cb, pattern=r"^admin:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(
+        MessageHandler(~filters.COMMAND & ~filters.StatusUpdate.ALL, on_maybe_broadcast),
+        group=-1,
+    )
     app.add_error_handler(on_error)
 
     logger.info("Bot is starting... (yt-dlp %s)", yt_dlp.version.__version__)
