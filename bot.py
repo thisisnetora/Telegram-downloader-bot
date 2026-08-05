@@ -326,8 +326,9 @@ def fetch_og_image(url: str):
         timeout=20,
     )
     for pattern in (
-        r'property="og:image"\s+content="([^"]+)"',
-        r'content="([^"]+)"\s+property="og:image"',
+        # Attribute order varies — allow anything between them, same tag only.
+        r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"',
+        r'<meta[^>]*content="([^"]+)"[^>]*property="og:image"',
         r'"image_xlarge_url"\s*:\s*"([^"]+)"',
         r'"image_large_url"\s*:\s*"([^"]+)"',
         r'"orig"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"',
@@ -335,7 +336,10 @@ def fetch_og_image(url: str):
         m = re.search(pattern, resp.text)
         if m:
             # Pinterest embeds image URLs as JSON — slashes come escaped.
-            return m.group(1).replace("\\/", "/").replace("&amp;", "&")
+            found = m.group(1).replace("\\/", "/").replace("&amp;", "&")
+            # i.pinimg.com serves a resized variant — grab the original.
+            found = re.sub(r"i\.pinimg\.com/\d+x\d*/", "i.pinimg.com/originals/", found)
+            return found
     logger.warning(
         "No image found in page %s (status %s, %d chars)",
         url, resp.status_code, len(resp.text),
