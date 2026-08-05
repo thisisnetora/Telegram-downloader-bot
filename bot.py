@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yt_dlp
+from pytubefix import YouTube
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -517,6 +518,15 @@ def _run_ydl(opts: dict, url: str, dl: bool):
 
 def extract_metadata(url: str):
     """Fetch title/thumbnail/etc. without downloading anything."""
+    if detect_platform(url) == "youtube":
+        last = None
+        for client in PYTUBE_CLIENTS:
+            try:
+                return _pytube_info(YouTube(url, client=client), url)
+            except Exception as e:
+                logger.warning("pytubefix metadata via %s failed for %s: %s", client, url, e)
+                last = e
+        raise last
     opts = _with_auth({
         "quiet": True,
         "no_warnings": True,
@@ -527,8 +537,142 @@ def extract_metadata(url: str):
     return _run_ydl(opts, url, False)
 
 
+# ---------------------------------------------------------------------------
+# YouTube via pytubefix. The ANDROID_VR client streams without cookies or a PO
+# token, sidestepping the "Requested format is not available" wall yt-dlp hits
+# from datacenter IPs. yt-dlp stays in place for the other platforms.
+# ---------------------------------------------------------------------------
+
+# Cookieless InnerTube clients, tried in order — none need a PO token.
+PYTUBE_CLIENTS = ["ANDROID_VR", "TV", "ANDROID"]
+
+
+def _pytube_height(stream) -> int:
+    r = stream.resolution or ""
+    return int(r[:-1]) if r.endswith("p") and r[:-1].isdigit() else 0
+
+
+def _pytube_abr(stream) -> int:
+    m = re.match(r"(\d+)", stream.abr or "")
+    return int(m.group(1)) if m else 0
+
+
+def _pick_video_stream(yt, quality: int):
+    streams = yt.streams.filter(adaptive=True, type="video", file_extension="mp4")
+    if not streams:
+        return None
+    cands = [s for s in streams if _pytube_height(s) <= quality] or list(streams)
+    # Prefer H.264 (avc1) — Telegram plays it natively — then highest res, then fps.
+    avc = [s for s in cands if (s.video_codec or "").startswith("avc1")]
+    pool = avc or cands
+    return max(pool, key=lambda s: (_pytube_height(s), s.fps or 0))
+
+
+def _pick_audio_stream(yt, prefer_m4a: bool):
+    auds = yt.streams.filter(only_audio=True)
+    if not auds:
+        return None
+    pool = auds
+    if prefer_m4a:
+        m4a = [s for s in auds if s.mime_type == "audio/mp4"]
+        pool = m4a or auds
+    return max(pool, key=_pytube_abr)
+
+
+def _pytube_progress(loop, status_message, label):
+    state: dict = {}
+
+    def cb(stream, chunk, bytes_remaining):
+        total = getattr(stream, "filesize", 0) or 0
+        if not total:
+            return
+        downloaded = max(0, total - bytes_remaining)
+        pct = downloaded / total * 100
+        if pct - state.get("last", -10) >= 10:
+            state["last"] = pct
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(
+                    status_message,
+                    f"⬇️ در حال دانلود از <b>{label}</b>...\n\n"
+                    f"{progress_bar(pct)}  {fa(f'{pct:.0f}')}٪\n"
+                    f"📦 {fmt_size(downloaded)} از {fmt_size(total)}",
+                ),
+                loop,
+            )
+
+    return cb
+
+
+def _pytube_info(yt, url) -> dict:
+    return {
+        "title": yt.title,
+        "duration": yt.length,
+        "uploader": yt.author,
+        "view_count": yt.views,
+        "description": yt.description or "",
+        "thumbnail": yt.thumbnail_url,
+        "webpage_url": url,
+        "duration_string": None,
+        "categories": [],
+        "tags": [],
+    }
+
+
+def _download_youtube_once(url, workdir, status_message, loop, quality, audio, client):
+    workdir = Path(workdir)
+    uid = uuid.uuid4().hex[:8]
+    label = "🎧 صدا" if audio else "🎬 ویدیو"
+    yt = YouTube(url, client=client,
+                 on_progress_callback=_pytube_progress(loop, status_message, label))
+
+    if audio:
+        stream = _pick_audio_stream(yt, prefer_m4a=False)
+        if not stream:
+            raise RuntimeError("جریان صوتی برای این ویدیو پیدا نشد")
+        raw = stream.download(output_path=str(workdir), filename=f"{uid}_a")
+        out = workdir / f"{uid}.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", raw, "-vn", "-codec:a", "libmp3lame", "-q:a", "2", str(out)],
+            check=True, capture_output=True,
+        )
+        Path(raw).unlink(missing_ok=True)
+        return [out], _pytube_info(yt, url)
+
+    video = _pick_video_stream(yt, quality or 1080)
+    if not video:
+        raise RuntimeError("جریان ویدیویی برای این ویدیو پیدا نشد")
+    vp = video.download(output_path=str(workdir), filename=f"{uid}_v.mp4")
+    out = workdir / f"{uid}.mp4"
+    audio_s = _pick_audio_stream(yt, prefer_m4a=True)
+    if audio_s:
+        ap = audio_s.download(output_path=str(workdir), filename=f"{uid}_a.m4a")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", vp, "-i", ap, "-c:v", "copy", "-c:a", "aac",
+             "-movflags", "+faststart", str(out)],
+            check=True, capture_output=True,
+        )
+        Path(ap).unlink(missing_ok=True)
+        Path(vp).unlink(missing_ok=True)
+    else:
+        Path(vp).rename(out)
+    return [out], _pytube_info(yt, url)
+
+
+def download_youtube(url, workdir, status_message, loop, quality=None, audio=False):
+    last = None
+    for client in PYTUBE_CLIENTS:
+        try:
+            return _download_youtube_once(url, workdir, status_message, loop, quality, audio, client)
+        except Exception as e:
+            logger.warning("pytubefix client %s failed for %s: %s", client, url, e)
+            last = e
+    raise last
+
+
 def download(url: str, workdir: Path, status_message, loop,
              quality: int | None = None, audio: bool = False) -> tuple[list[Path], dict]:
+    if detect_platform(url) == "youtube":
+        return download_youtube(url, workdir, status_message, loop, quality, audio)
     label = PLATFORM_META.get(detect_platform(url) or "", ("🔗", "لینک"))[1]
     opts = {
         "outtmpl": str(workdir / "%(title).100s-%(id)s.%(ext)s"),
