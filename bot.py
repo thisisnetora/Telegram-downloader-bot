@@ -1,6 +1,7 @@
 """Telegram downloader bot — YouTube, Instagram, TikTok, Pinterest."""
 
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -39,10 +40,23 @@ MAX_FILE_SIZE = 49 * 1024 * 1024  # Telegram Bot API upload limit is 50 MB
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
-# env var instead and we materialize the file at startup.
+# env var instead and we materialize the file at startup. Base64 is the
+# safest option: multiline env vars can get mangled by some dashboards.
+_cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
 _cookies_content = os.environ.get("COOKIES_CONTENT", "").strip()
-if _cookies_content and not Path(COOKIES_FILE).exists():
+if _cookies_b64 and not Path(COOKIES_FILE).exists():
+    try:
+        Path(COOKIES_FILE).write_bytes(base64.b64decode(_b64))
+    except Exception:
+        logger.exception("COOKIES_B64 is not valid base64")
+elif _cookies_content and not Path(COOKIES_FILE).exists():
     Path(COOKIES_FILE).write_text(_cookies_content, encoding="utf-8")
+
+if Path(COOKIES_FILE).exists():
+    _lines = Path(COOKIES_FILE).read_text(encoding="utf-8", errors="replace").splitlines()
+    logger.info("Cookies file loaded: %d lines", len(_lines))
+else:
+    logger.warning("No cookies file — YouTube will likely block datacenter IPs")
 BASE_WORK_DIR = Path(tempfile.gettempdir()) / "tg-downloader-bot"
 
 URL_RE = re.compile(r"https?://[^\s<>'\"]+")
@@ -511,7 +525,9 @@ async def process_download(message, url: str,
             hint = "\n\n💡 بعضی پست‌های اینستاگرام نیاز به لاگین دارن — کوکی لازمه."
         await safe_edit(
             status,
-            f"❌ دانلود نشد.\n\n🛠 دلیل:\n{reason or 'خطای ناشناخته'}{hint}",
+            f"❌ دانلود نشد.\n\n🛠 دلیل:\n{reason or 'خطای ناشناخته'}{hint}\n\n"
+            f"🔧 yt-dlp {yt_dlp.version.__version__} • "
+            f"کوکی: {'✅' if Path(COOKIES_FILE).exists() else '❌'}",
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
