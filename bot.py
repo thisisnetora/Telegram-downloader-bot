@@ -365,13 +365,16 @@ def make_progress_hook(loop, status_message, label: str):
     return hook
 
 
-# When cookies exist, use the browser-matching clients — they're the only ones
-# that present cookies the way YouTube's "sign in to confirm you're not a bot"
-# check expects. web_safari also yields token-free HLS formats as a fallback.
-YT_CLIENTS_COOKIE = ["web", "mweb", "web_safari"]
-# Without cookies there's no session to send; these cookieless clients are the
-# only chance of getting formats on a flagged IP.
-YT_CLIENTS_NOAUTH = ["android_vr", "android", "tv"]
+# Verified against live YouTube (2026-08): the WEBPO clients below BOTH accept a
+# bgutil PO token (required to get any format on a datacenter IP) AND are not
+# subject to YouTube's SABR-only experiment, so they still return direct format
+# URLs. web/mweb/web_safari/web_embedded are SABR-only now — yt-dlp skips their
+# URL-less formats, which is exactly the "Requested format is not available"
+# error, even with a valid PO token. So they are useless and no longer tried.
+YT_CLIENTS_POT = ["tvhtml5", "web_remix", "tvhtml5_simply"]
+# Cookieless clients that return direct URLs without a PO token — the fallback
+# when the POT server isn't running (e.g. local dev) or the IP isn't flagged.
+YT_CLIENTS_NOAUTH = ["android_vr", "android_testsuite", "android_producer"]
 # bgutil PO-token provider (built into the Docker image): generates the tokens
 # YouTube's web clients demand, which is what unlocks the formats behind
 # "Requested format is not available". We run it as an in-process HTTP server
@@ -457,9 +460,10 @@ def _yt_args(clients) -> dict:
 def _with_auth(opts: dict, url: str = "") -> dict:
     has_cookies = Path(COOKIES_FILE).exists()
     if url and detect_platform(url) == "youtube":
-        opts["extractor_args"] = _yt_args(
-            YT_CLIENTS_COOKIE if has_cookies else YT_CLIENTS_NOAUTH
-        )
+        opts["extractor_args"] = _yt_args(YT_CLIENTS_POT)
+        # The n/sig challenge needs a JS runtime. yt-dlp defaults to deno only,
+        # so enable node (>= v22) too as a fallback.
+        opts.setdefault("js_runtimes", {"deno": {}, "node": {}})
     if has_cookies:
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -477,10 +481,10 @@ def _retryable_yt_error(exc: Exception) -> bool:
 
 
 def _client_order(has_cookies: bool) -> list:
-    # Browser clients first when logged in (cookies actually get sent); the
-    # cookieless clients are the only hope when there's no session.
-    return (["web", "mweb", "web_safari", "tv", "android_vr"] if has_cookies
-            else ["android_vr", "android", "tv", "web_safari", "web"])
+    # POT-backed non-SABR clients first (best chance on a flagged IP), cookieless
+    # clients as the last resort.
+    return (YT_CLIENTS_POT + YT_CLIENTS_NOAUTH if has_cookies
+            else YT_CLIENTS_NOAUTH + YT_CLIENTS_POT)
 
 
 def _run_ydl(opts: dict, url: str, dl: bool):
@@ -775,8 +779,9 @@ async def process_download(message, url: str,
         low = reason.lower()
         if "requested format" in low or "no video formats" in low:
             hint = (
-                "\n\n💡 فرمتی از یوتیوب برنگشته — معمولاً یعنی کوکی منقضی شده. "
-                "یه کوکی تازه از مرورگر اکسپورت کن و COOKIES_CONTENT رو آپدیت کن."
+                "\n\n💡 یوتیوب فرمتی برنگردوند — معمولاً یعنی PO-token provider "
+                "روی سرور بالا نیومده یا IP سرور موقتاً فلگ شده. چند لحظه‌ی دیگه "
+                "دوباره امتحان کن؛ اگه ادامه داشت به ادمین خبر بده."
             )
         elif "sign in" in low or "login" in low or "not a bot" in low:
             hint = (
