@@ -657,7 +657,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
 
-    logger.info("Bot is starting...")
+    logger.info("Bot is starting... (yt-dlp %s)", yt_dlp.version.__version__)
     app.run_polling(drop_pending_updates=True)
 
 
