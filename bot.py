@@ -48,6 +48,871 @@ except ValueError:
     MAX_FILE_SIZE = 49 * 1024 * 1024
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
 
+# Link promoted in the welcome message / "join our channel" button.
+# Set CHANNEL_LINK explicitly (e.g. https://t.me/netora), otherwise we
+# reuse the force-join channel if one is configured.
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "").strip()
+if not CHANNEL_LINK:
+    CHANNEL_LINK = os.environ.get("FORCE_JOIN_LINK", "").strip()
+if not CHANNEL_LINK and FORCE_JOIN_CHANNEL:
+    CHANNEL_LINK = f"https://t.me/{FORCE_JOIN_CHANNEL.lstrip('@')}"
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "").strip() or FORCE_JOIN_CHANNEL
+
+# On hosts like Railway you can't upload files easily — pass cookies as an
+# env var instead and we materialize the file at startup. Base64 is the
+# safest option: multiline env vars can get mangled by some dashboards.
+_cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
+_cookies_content = os.environ.get("COOKIES_CONTENT", "").strip()
+if _cookies_b64 and not Path(COOKIES_FILE).exists():
+    try:
+        Path(COOKIES_FILE).write_bytes(base64.b64decode(_cookies_b64))
+    except Exception:
+        logger.exception("COOKIES_B64 is not valid base64")
+elif _cookies_content and not Path(COOKIES_FILE).exists():
+    Path(COOKIES_FILE).write_text(_cookies_content, encoding="utf-8")
+
+HAS_COOKIES = Path(COOKIES_FILE).exists()
+if HAS_COOKIES:
+    _lines = Path(COOKIES_FILE).read_text(encoding="utf-8", errors="replace").splitlines()
+    logger.info("Cookies file loaded: %d lines", len(_lines))
+else:
+    logger.warning("No cookies file — YouTube will likely block datacenter IPs")
+BASE_WORK_DIR = Path(tempfile.gettempdir()) / "tg-downloader-bot"
+
+URL_RE = re.compile(r"https?://[^\s<>'\"]+")
+
+PLATFORMS = [
+    ("youtube", re.compile(r"(youtube\.com|youtu\.be)", re.I)),
+    ("instagram", re.compile(r"instagram\.com", re.I)),
+    ("tiktok", re.compile(r"(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)", re.I)),
+    ("pinterest", re.compile(r"(pinterest\.[a-z.]+|pin\.it)", re.I)),
+]
+
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov"}
+AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".opus", ".wav"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+# token -> {"url": str, "info": dict | None}
+pending: dict[str, dict] = {}
+download_sem = asyncio.Semaphore(3)
+stats = {"total": 0}
+
+PLATFORM_META = {
+    "youtube": ("📺", "یوتیوب"),
+    "instagram": ("📸", "اینستاگرام"),
+    "tiktok": ("🎵", "تیک‌تاک"),
+    "pinterest": ("📌", "پینترست"),
+}
+
+JOIN_REQUIRED = (
+    "🔒 برای استفاده از ربات، اول باید عضو کانال ما بشی.\n\n"
+    "بعد از عضویت، دکمه «✅ عضو شدم» رو بزن."
+)
+
+
+def join_keyboard() -> InlineKeyboardMarkup:
+    link = os.environ.get("FORCE_JOIN_LINK", "").strip()
+    if not link:
+        link = f"https://t.me/{FORCE_JOIN_CHANNEL.lstrip('@')}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ عضویت در کانال", url=link)],
+        [InlineKeyboardButton("✅ عضو شدم", callback_data="join:check")],
+    ])
+
+
+def welcome_keyboard() -> InlineKeyboardMarkup | None:
+    """Button promoting the Netora channel on /start (separate from the
+    hard force-join gate — this is just a friendly link)."""
+    if not CHANNEL_LINK:
+        return None
+    label = f"📢 کانال {BOT_BRAND}"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, url=CHANNEL_LINK)]])
+
+
+async def is_member(bot, user_id: int) -> bool:
+    if not FORCE_JOIN_CHANNEL:
+        return True
+    try:
+        member = await bot.get_chat_member(FORCE_JOIN_CHANNEL, user_id)
+        if member.status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            return True
+        return (
+            member.status == ChatMemberStatus.RESTRICTED
+            and getattr(member, "is_member", False)
+        )
+    except Exception as exc:
+        logger.warning(
+            "Membership check failed (%s). Is the bot an admin in %s?",
+            exc, FORCE_JOIN_CHANNEL,
+        )
+        return True  # fail open so a misconfigured channel doesn't break the bot
+
+
+async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if await is_member(context.bot, update.effective_user.id):
+        return True
+    if update.message:
+        await update.message.reply_text(JOIN_REQUIRED, reply_markup=join_keyboard())
+    elif update.callback_query:
+        try:
+            await update.callback_query.answer("❌ اول عضو کانال شو!", show_alert=True)
+        except Exception:
+            pass  # query may already have been answered
+    return False
+
+
+def build_welcome() -> str:
+    text = f"""
+✨ <b>به {BOT_BRAND} خوش اومدی!</b>
+
+لینک بفرست، تحویل بگیر — همین‌قدر ساده ⚡
+
+📺 <b>یوتیوب</b>
+└ کیفیت ۱۰۸۰ تا ۳۶۰ + 🎧 MP3 با کارت اطلاعات ویدیو
+
+📸 <b>اینستاگرام</b>
+└ ریلز، پست ویدیویی و کاروسل
+
+🎵 <b>تیک‌تاک</b>
+└ ویدیو و آلبوم عکس
+
+📌 <b>پینترست</b>
+└ ویدیو و عکس HD
+
+🚀 برای شروع، همین حالا یک لینک بفرست!
+"""
+    if CHANNEL_USERNAME or CHANNEL_LINK:
+        handle = f"@{CHANNEL_USERNAME.lstrip('@')}" if CHANNEL_USERNAME else CHANNEL_LINK
+        text += f"\n📢 عضو کانال {BOT_BRAND} هم بشو: {handle}\n"
+    return text
+
+
+HELP = """
+📖 <b>راهنمای استفاده</b>
+
+۱. لینک پست رو کپی کن
+۲. همین‌جا بفرست
+۳. چند لحظه صبر کن تا فایل برسه ⏳
+
+✨ <b>قابلیت‌ها:</b>
+• یوتیوب: کارت اطلاعات ویدیو + انتخاب کیفیت + MP3
+• تیک‌تاک و اینستا: دانلود خودکار، حتی پست‌های چندعکسی
+• نمایش عنوان، مدت و حجم فایل روی هر دانلود
+
+💡 <b>نکته‌ها:</b>
+• حداکثر حجم فایل: ۵۰ مگابایت (محدودیت تلگرام)
+• اگر ویدیوی یوتیوب حجیم بود، کیفیت پایین‌تر یا MP3 رو انتخاب کن
+"""
+
+
+def detect_platform(url: str):
+    for name, pattern in PLATFORMS:
+        if pattern.search(url):
+            return name
+    return None
+
+
+_FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def fa(text) -> str:
+    return str(text).translate(_FA_DIGITS)
+
+
+def fmt_duration(seconds) -> str:
+    if not seconds:
+        return ""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    out = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    return fa(out)
+
+
+def fmt_size(num_bytes: float) -> str:
+    mb = num_bytes / 1024 / 1024
+    if mb >= 1024:
+        return f"{fa(f'{mb / 1024:.1f}')} گیگابایت"
+    if mb >= 1:
+        return f"{fa(f'{mb:.0f}')} مگابایت"
+    return f"{fa(f'{num_bytes / 1024:.0f}')} کیلوبایت"
+
+
+def fmt_views(count) -> str:
+    if not count:
+        return ""
+    if count >= 1_000_000:
+        return f"{fa(f'{count / 1_000_000:.1f}')} میلیون بازدید"
+    if count >= 1_000:
+        return f"{fa(f'{count / 1_000:.0f}')} هزار بازدید"
+    return f"{fa(count)} بازدید"
+
+
+def progress_bar(pct: float) -> str:
+    filled = min(10, int(pct // 10))
+    return "🟩" * filled + "⬜" * (10 - filled)
+
+
+async def safe_edit(message, text: str, parse_mode: str | None = None):
+    try:
+        await message.edit_text(text, parse_mode=parse_mode)
+    except Exception:
+        pass
+
+
+def make_progress_hook(loop, status_message, state):
+    def hook(d):
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            if total:
+                pct = downloaded / total * 100
+                if pct - state.get("last", -10) >= 10:
+                    state["last"] = pct
+                    asyncio.run_coroutine_threadsafe(
+                        safe_edit(
+                            status_message,
+                            f"⬇️ در حال دانلود...\n{progress_bar(pct)} {pct:.0f}%",
+                        ),
+                        loop,
+                    )
+        elif d.get("status") == "finished":
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(status_message, "⚙️ در حال پردازش نهایی..."), loop
+            )
+
+    return hook
+
+
+def _cookies_opts(opts: dict) -> dict:
+    if HAS_COOKIES:
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def _youtube_client_attempts() -> list[dict | None]:
+    """Order of player-client sets to try for YouTube.
+
+    Cookies only carry a logged-in session for the web-family clients
+    (web/mweb) — android/tv/ios ignore cookies entirely. So if a video
+    needs login (age-restricted, region-unlocked-when-signed-in, etc.)
+    the anonymous clients will always report zero formats regardless of
+    cookies, and trying them first just wastes a request and hides the
+    real fix. When cookies are present we try the clients that can
+    actually use them first; otherwise we start with the anonymous
+    clients that usually dodge PO-token gating.
+    """
+    if HAS_COOKIES:
+        return [
+            {"youtube": {"player_client": ["web", "mweb"]}},
+            {"youtube": {"player_client": ["tv", "web_safari"]}},
+            {"youtube": {"player_client": ["android_vr", "android", "ios"]}},
+            None,  # yt-dlp's own default client selection, no restriction
+        ]
+    return [
+        {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
+        {"youtube": {"player_client": ["ios", "web", "mweb"]}},
+        None,
+    ]
+
+
+def extract_metadata(url: str):
+    """Fetch title/thumbnail/etc. without downloading anything. Tries the
+    same client fallback chain as download() so the info card is just as
+    reliable as the actual download."""
+    if detect_platform(url) == "youtube":
+        attempts = _youtube_client_attempts()
+    else:
+        attempts = [None]
+
+    last_exc = None
+    for extractor_args in attempts:
+        opts = _cookies_opts({
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "socket_timeout": 20,
+        })
+        if extractor_args:
+            opts["extractor_args"] = extractor_args
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info:
+                return info
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if last_exc:
+        raise last_exc
+    return {}
+
+
+def _format_string(quality: int | None, audio: bool) -> str:
+    """Flexible format selector — no hard ext=mp4/m4a restriction, so we
+    don't accidentally throw away every available format on clients that
+    only expose webm/opus streams. Always ends in a bare 'b' (best
+    available, any container) so it should never come up empty as long as
+    *some* format exists for the chosen client."""
+    if audio:
+        return "bestaudio/best"
+    if quality:
+        return f"bv*[height<={quality}]+ba/b[height<={quality}]/bv*+ba/b"
+    return "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+
+
+def _probe_format_count(url: str) -> int | None:
+    """Diagnostic-only lookup: how many formats does yt-dlp see for this
+    URL with no client restriction at all? Used to tell the user whether
+    the video is genuinely blocked (0 formats) vs. our selector was just
+    too strict (formats exist)."""
+    try:
+        opts = _cookies_opts({
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "socket_timeout": 20,
+        })
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return len(info.get("formats") or [])
+    except Exception:
+        return None
+
+
+def download(url: str, workdir: Path, status_message, loop,
+             quality: int | None = None, audio: bool = False) -> tuple[list[Path], dict]:
+    base_opts = {
+        "outtmpl": str(workdir / "%(title).100s-%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "restrictfilenames": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "writethumbnail": False,
+        "writesubtitles": False,
+        "progress_hooks": [make_progress_hook(loop, status_message, {})],
+        "format": _format_string(quality, audio),
+    }
+    # A TikTok photo post or IG carousel IS a playlist — download all items.
+    # For YouTube keep the single video only, even if the URL has &list=.
+    is_youtube = detect_platform(url) == "youtube"
+    if is_youtube:
+        base_opts["noplaylist"] = True
+    else:
+        base_opts["noplaylist"] = False
+        base_opts["playlistend"] = 10
+        # Skip failed downloads inside carousels, but still surface
+        # extraction errors (login required, no video, ...) to the user.
+        base_opts["ignoreerrors"] = "only_download"
+
+    if audio:
+        base_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    else:
+        base_opts["merge_output_format"] = "mp4"
+
+    _cookies_opts(base_opts)
+
+    client_attempts = _youtube_client_attempts() if is_youtube else [None]
+
+    last_exc = None
+    for extractor_args in client_attempts:
+        opts = dict(base_opts)
+        if extractor_args:
+            opts["extractor_args"] = extractor_args
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            files = sorted(
+                (p for p in workdir.iterdir() if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if files:
+                return files, (info or {})
+        except yt_dlp.utils.DownloadError as exc:
+            last_exc = exc
+            if "requested format is not available" in str(exc).lower():
+                continue  # try the next client set
+            raise  # any other error should surface immediately
+
+    if last_exc:
+        if is_youtube:
+            fmt_count = _probe_format_count(url)
+            if fmt_count == 0:
+                raise RuntimeError(
+                    "این ویدیو هیچ فرمت قابل‌دانلودی نداره — احتمالاً سنی/خصوصی/"
+                    "مخصوص عضو خاصه یا کوکی منقضی شده. با اکانتی که خود ویدیو رو "
+                    "توی مرورگر می‌بینه، کوکی جدید بگیر."
+                ) from last_exc
+            if fmt_count:
+                raise RuntimeError(
+                    f"{fmt_count} فرمت برای این ویدیو پیدا شد ولی هیچ‌کدوم با "
+                    "کیفیت درخواستی جور درنیومد — لطفاً کیفیت دیگه‌ای رو امتحان کن."
+                ) from last_exc
+        raise last_exc
+    return [], {}
+
+
+def fetch_og_image(url: str):
+    import requests
+
+    resp = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                          "Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=20,
+    )
+    for pattern in (
+        # Attribute order varies — allow anything between them, same tag only.
+        r'<meta[^>]*property="og:image"[^>]*content="([^"]+)"',
+        r'<meta[^>]*content="([^"]+)"[^>]*property="og:image"',
+        r'"image_xlarge_url"\s*:\s*"([^"]+)"',
+        r'"image_large_url"\s*:\s*"([^"]+)"',
+        r'"orig"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"',
+    ):
+        m = re.search(pattern, resp.text)
+        if m:
+            # Pinterest embeds image URLs as JSON — slashes come escaped.
+            found = m.group(1).replace("\\/", "/").replace("&amp;", "&")
+            # i.pinimg.com serves a resized variant — grab the original.
+            found = re.sub(r"i\.pinimg\.com/\d+x\d*/", "i.pinimg.com/originals/", found)
+            return found
+    logger.warning(
+        "No image found in page %s (status %s, %d chars)",
+        url, resp.status_code, len(resp.text),
+    )
+    return None
+
+
+def build_caption(info: dict, url: str, size: int, bot_username: str) -> str:
+    emoji, label = PLATFORM_META.get(detect_platform(url) or "", ("🔗", "لینک"))
+    title = (info.get("title") or info.get("description") or "").strip()
+    title = html.escape(re.sub(r"\s+", " ", title)[:120])
+
+    lines = []
+    if title:
+        lines.append(f"🎬 <b>{title}</b>\n")
+
+    # Rich info line — uploader / duration / views, same data as the
+    # pre-download quality-selection card.
+    details = []
+    if info.get("uploader"):
+        details.append(f"👤 {html.escape(str(info['uploader']))}")
+    if info.get("duration"):
+        details.append(f"⏱ {fmt_duration(info['duration'])}")
+    if info.get("view_count"):
+        details.append(f"👁 {fmt_views(info['view_count'])}")
+    if details:
+        lines.append("  •  ".join(details))
+
+    parts = [f"{emoji} {label}"]
+    if size:
+        parts.append(f"📦 {fmt_size(size)}")
+    lines.append("  •  ".join(parts))
+
+    footer = f"🤖 @{bot_username}" if bot_username else ""
+    if footer:
+        lines.append(f"\n{footer}")
+    return "\n".join(lines)
+
+
+async def deliver(message, files: list[Path], caption: str = "",
+                  thumbnail=None, title: str | None = None):
+    images = [f for f in files if f.suffix.lower() in IMAGE_EXTS]
+    others = [f for f in files if f.suffix.lower() not in IMAGE_EXTS]
+
+    if len(images) > 1:
+        for i in range(0, len(images), 10):
+            batch = images[i:i + 10]
+            handles = [open(p, "rb") for p in batch]
+            try:
+                await message.reply_media_group([InputMediaPhoto(h) for h in handles])
+            except Exception:
+                # Telegram photos must be JPEG/PNG — send webp etc. as files.
+                for h in handles:
+                    h.seek(0)
+                    await message.reply_document(h)
+            finally:
+                for h in handles:
+                    h.close()
+        if caption:
+            await message.reply_text(caption, parse_mode="HTML")
+    elif images:
+        img = images[0]
+        with open(img, "rb") as fh:
+            try:
+                await message.reply_photo(fh, caption=caption, parse_mode="HTML")
+            except Exception:
+                # Telegram photos must be JPEG/PNG — webp etc. go as documents.
+                fh.seek(0)
+                await message.reply_document(fh, caption=caption, parse_mode="HTML")
+
+    for f in others:
+        ext = f.suffix.lower()
+        with open(f, "rb") as fh:
+            if ext in VIDEO_EXTS:
+                await message.reply_video(
+                    fh, caption=caption, parse_mode="HTML",
+                    supports_streaming=True, thumbnail=thumbnail,
+                )
+            elif ext in AUDIO_EXTS:
+                await message.reply_audio(
+                    fh, caption=caption, parse_mode="HTML",
+                    thumbnail=thumbnail, title=title,
+                )
+            else:
+                await message.reply_document(fh, caption=caption, parse_mode="HTML")
+
+
+async def reply_image(message, image_url: str, caption: str):
+    """Send an image by URL; fall back to a document if Telegram rejects it."""
+    try:
+        await message.reply_photo(image_url, caption=caption)
+    except Exception:
+        await message.reply_document(image_url, caption=caption)
+
+
+async def process_download(message, url: str,
+                           quality: int | None = None, audio: bool = False,
+                           status_message=None, known_info: dict | None = None):
+    chat = message.chat
+    emoji, label = PLATFORM_META.get(detect_platform(url) or "", ("🔗", "لینک"))
+
+    # Show the cached video card info (title) on the status message right
+    # away, instead of a generic "link received" line.
+    intro = f"{emoji} لینک {label} دریافت شد..."
+    if known_info and known_info.get("title"):
+        safe_title = html.escape(known_info["title"][:80])
+        intro = f"🎬 {safe_title}\n{emoji} {label}  •  در حال آماده‌سازی..."
+        status = status_message or await message.reply_text(intro, parse_mode="HTML")
+    else:
+        status = status_message or await message.reply_text(intro)
+
+    workdir = BASE_WORK_DIR / uuid.uuid4().hex[:12]
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        await chat.send_action(ChatAction.UPLOAD_VIDEO)
+        loop = asyncio.get_running_loop()
+
+        async with download_sem:
+            await safe_edit(status, f"⬇️ در حال دانلود از {label}...")
+            files, info = await asyncio.to_thread(
+                download, url, workdir, status, loop, quality, audio
+            )
+
+        # Merge: downloaded info takes priority, cached metadata fills gaps
+        # (e.g. if the successful download client returned less metadata
+        # than the initial extraction did).
+        merged_info = {**(known_info or {}), **(info or {})}
+
+        # Some pins/posts are plain images — yt-dlp can't handle them.
+        if not files:
+            image_url = await asyncio.to_thread(fetch_og_image, url)
+            if image_url:
+                await status.delete()
+                stats["total"] += 1
+                await reply_image(
+                    message, image_url,
+                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 {BOT_BRAND} • @{message.get_bot().username}",
+                )
+                return
+            raise RuntimeError("nothing downloaded")
+
+        ok = [f for f in files if f.stat().st_size <= MAX_FILE_SIZE]
+        if not ok:
+            await safe_edit(
+                status,
+                f"⚠️ حجم فایل {fmt_size(max(f.stat().st_size for f in files))}ه "
+                f"و از سقف مجاز ({fmt_size(MAX_FILE_SIZE)}) بیشتره.\n\n"
+                f"💡 برای یوتیوب: لینک رو دوباره بفرست و کیفیت پایین‌تر "
+                f"یا MP3 رو انتخاب کن.",
+            )
+            return
+
+        await safe_edit(status, "📤 در حال آپلود به تلگرام...")
+        await chat.send_action(ChatAction.UPLOAD_VIDEO)
+        stats["total"] += 1
+        total_size = sum(f.stat().st_size for f in ok)
+        caption = build_caption(merged_info, url, total_size, message.get_bot().username)
+        caption += f"\n🔢 دانلود شماره {fa(stats['total'])}"
+        await deliver(
+            message, ok, caption=caption,
+            thumbnail=merged_info.get("thumbnail"), title=merged_info.get("title"),
+        )
+        await status.delete()
+
+    except Exception as exc:
+        logger.exception("Download failed: %s", url)
+
+        # Image-only pins/posts raise "no video" errors — grab the image.
+        if "no video" in str(exc).lower():
+            image_url = await asyncio.to_thread(fetch_og_image, url)
+            if image_url:
+                await status.delete()
+                stats["total"] += 1
+                await reply_image(
+                    message, image_url,
+                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 {BOT_BRAND} • @{message.get_bot().username}",
+                )
+                return
+
+        reason = re.sub(r"^ERROR:\s*", "", str(exc)).replace(url, "").strip()
+        if len(reason) > 300:
+            reason = reason[:300] + "…"
+        hint = ""
+        if "sign in" in reason.lower() or "login" in reason.lower():
+            hint = (
+                "\n\n💡 یوتیوب/اینستاگرام IP سرور رو بلاک کرده. "
+                "راه‌حل: فایل کوکی مرورگرت رو در متغیر COOKIES_CONTENT روی "
+                "Railway ست کن (راهنما توی README)."
+            )
+        elif "instagram" in url:
+            hint = "\n\n💡 بعضی پست‌های اینستاگرام نیاز به لاگین دارن — کوکی لازمه."
+        await safe_edit(
+            status,
+            f"❌ دانلود نشد.\n\n🛠 دلیل:\n{reason or 'خطای ناشناخته'}{hint}\n\n"
+            f"🔧 yt-dlp {yt_dlp.version.__version__} • "
+            f"کوکی: {'✅' if HAS_COOKIES else '❌'}",
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
+    await update.message.reply_text(
+        build_welcome(), parse_mode="HTML", reply_markup=welcome_keyboard()
+    )
+
+
+async def on_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP, parse_mode="HTML")
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_membership(update, context):
+        return
+    text = update.message.text or ""
+    match = URL_RE.search(text)
+    if not match:
+        await update.message.reply_text(
+            "🔗 لینک یوتیوب، اینستاگرام، تیک‌تاک یا پینترست رو برام بفرست."
+        )
+        return
+
+    url = match.group(0)
+    platform = detect_platform(url)
+
+    if platform == "youtube":
+        await send_youtube_card(update.message, url)
+    else:
+        await process_download(update.message, url)
+
+
+def youtube_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎬 ۱۰۸۰", callback_data=f"yt:1080:{token}"),
+            InlineKeyboardButton("🎬 ۷۲۰", callback_data=f"yt:720:{token}"),
+            InlineKeyboardButton("🎬 ۴۸۰", callback_data=f"yt:480:{token}"),
+            InlineKeyboardButton("🎬 ۳۶۰", callback_data=f"yt:360:{token}"),
+        ],
+        [InlineKeyboardButton("🎧 MP3 — فقط صوت", callback_data=f"yt:mp3:{token}")],
+    ])
+
+
+def _video_card_text(info: dict) -> str:
+    title = html.escape((info.get("title") or "ویدیوی یوتیوب")[:150])
+    card = f"🎬 <b>{title}</b>\n\n"
+    details = []
+    if info.get("uploader"):
+        details.append(f"👤 {html.escape(str(info['uploader']))}")
+    if info.get("duration"):
+        details.append(f"⏱ {fmt_duration(info['duration'])}")
+    if info.get("view_count"):
+        details.append(f"👁 {fmt_views(info['view_count'])}")
+    if details:
+        card += "   ".join(details) + "\n\n"
+    card += "👇 کیفیت موردنظرت رو انتخاب کن:"
+    return card
+
+
+async def send_youtube_card(message, url: str):
+    token = uuid.uuid4().hex[:8]
+    keyboard = youtube_keyboard(token)
+
+    status = await message.reply_text("🔎 در حال دریافت اطلاعات ویدیو...")
+    try:
+        info = await asyncio.to_thread(extract_metadata, url)
+    except Exception:
+        # Metadata is a bonus — if it's blocked, still offer the buttons.
+        pending[token] = {"url": url, "info": None}
+        await safe_edit(
+            status,
+            "🎬 لینک یوتیوب دریافت شد!\n\n👇 کیفیت موردنظرت رو انتخاب کن:",
+        )
+        await status.edit_reply_markup(reply_markup=keyboard)
+        return
+
+    pending[token] = {"url": url, "info": info}
+    card = _video_card_text(info)
+
+    thumbnail = info.get("thumbnail")
+    await status.delete()
+    if thumbnail:
+        try:
+            await message.reply_photo(
+                thumbnail, caption=card, parse_mode="HTML", reply_markup=keyboard
+            )
+            return
+        except Exception:
+            pass
+    await message.reply_text(card, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await require_membership(update, context):
+        return
+    try:
+        _, q, token = query.data.split(":")
+    except ValueError:
+        return
+
+    entry = pending.pop(token, None)
+    if not entry:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "⌛ این درخواست منقضی شده. لینک رو دوباره بفرست."
+        )
+        return
+
+    url = entry["url"]
+    known_info = entry.get("info")
+
+    # The card message may be a photo — remove buttons, then let
+    # process_download create its own fresh status message (it will show
+    # the cached title/info immediately since we pass known_info through).
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    audio = q == "mp3"
+    quality = None if audio else int(q)
+    await process_download(query.message, url, quality=quality, audio=audio,
+                            known_info=known_info)
+
+
+async def on_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await is_member(context.bot, query.from_user.id):
+        await query.answer("✅ عضویت تأیید شد!")
+        await safe_edit(query.message, "✅ عضویتت تأیید شد! حالا لینک رو بفرست 🚀")
+    else:
+        await query.answer("❌ هنوز عضو کانال نشدی!", show_alert=True)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error", exc_info=context.error)
+
+
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده!")
+
+    builder = Application.builder().token(BOT_TOKEN)
+    if BOT_API_URL:
+        builder = (
+            builder
+            .base_url(f"{BOT_API_URL}/bot")
+            .base_file_url(f"{BOT_API_URL}/file/bot")
+            .read_timeout(600)
+            .write_timeout(600)
+            .connect_timeout(60)
+        )
+        logger.info("Using local Bot API server at %s (max upload %d MB)",
+                    BOT_API_URL, MAX_FILE_SIZE // 1024 // 1024)
+    app = builder.build()
+    app.add_handler(CommandHandler("start", on_start))
+    app.add_handler(CommandHandler("help", on_help))
+    app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^yt:"))
+    app.add_handler(CallbackQueryHandler(on_join_check, pattern=r"^join:check$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
+
+    logger.info("Bot is starting... (yt-dlp %s)", yt_dlp.version.__version__)
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
+"""Telegram downloader bot — YouTube, Instagram, TikTok, Pinterest."""
+
+import asyncio
+import base64
+import html
+import logging
+import os
+import re
+import shutil
+import tempfile
+import uuid
+from pathlib import Path
+
+import yt_dlp
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
+from telegram.constants import ChatAction, ChatMemberStatus
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
+FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
+# Official Bot API is capped at 50 MB. Point BOT_API_URL at a self-hosted
+# telegram-bot-api server (runs in --local mode) to raise it to ~2000 MB.
+BOT_API_URL = os.environ.get("BOT_API_URL", "").strip().rstrip("/")
+if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
+    BOT_API_URL = f"http://{BOT_API_URL}"
+try:
+    MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "").strip() or "49") * 1024 * 1024
+except ValueError:
+    MAX_FILE_SIZE = 49 * 1024 * 1024
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup. Base64 is the
 # safest option: multiline env vars can get mangled by some dashboards.
