@@ -259,22 +259,49 @@ def make_progress_hook(loop, status_message, label: str):
     return hook
 
 
-def _with_auth(opts: dict, url: str = "") -> dict:
-    """Attach cookies and pick YouTube player clients.
+# YouTube player clients that neither require PO tokens nor break when
+# cookies are attached: tv/web_embedded serve plain progressive formats,
+# web_safari adds token-free HLS variants. (web/mweb formats get PO-token
+# gated on datacenter IPs → "Requested format is not available".)
+YT_CLIENTS = ["tv", "web_embedded", "web_safari"]
+# Last resort for when stale cookies themselves break extraction.
+YT_CLIENTS_NOAUTH = ["android_vr", "android", "tv"]
 
-    Cookies are the reliable way past YouTube's datacenter-IP blocks, but only
-    web clients accept them — android clients ignore cookies, and mixing the
-    two makes YouTube withhold formats. So with a cookies file we let yt-dlp
-    use its default (web) clients; without one we fall back to the android/tv
-    clients that sometimes still serve unauthenticated formats.
-    """
+
+def _with_auth(opts: dict, url: str = "") -> dict:
+    if url and detect_platform(url) == "youtube":
+        opts["extractor_args"] = {"youtube": {"player_client": YT_CLIENTS}}
     if Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
-    elif url and detect_platform(url) == "youtube":
-        opts["extractor_args"] = {
-            "youtube": {"player_client": ["android_vr", "android", "tv"]}
-        }
     return opts
+
+
+def _retryable_yt_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "requested format is not available",
+        "sign in",
+        "po token",
+        "no video formats",
+        "http error 403",
+    ))
+
+
+def _run_ydl(opts: dict, url: str, dl: bool):
+    """Run extract_info; on YouTube auth/format errors retry once without
+    cookies on the no-auth clients (stale cookies can be the problem)."""
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=dl)
+    except Exception as exc:
+        if detect_platform(url) != "youtube" or not _retryable_yt_error(exc):
+            raise
+        logger.warning("YouTube failed (%s) — retrying without cookies", exc)
+        opts = dict(opts)
+        opts.pop("cookiefile", None)
+        opts["extractor_args"] = {"youtube": {"player_client": YT_CLIENTS_NOAUTH}}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=dl)
 
 
 def extract_metadata(url: str):
@@ -286,8 +313,7 @@ def extract_metadata(url: str):
         "skip_download": True,
         "socket_timeout": 20,
     }, url)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    return _run_ydl(opts, url, False)
 
 
 def download(url: str, workdir: Path, status_message, loop,
@@ -341,12 +367,11 @@ def download(url: str, workdir: Path, status_message, loop,
         opts["merge_output_format"] = "mp4"
 
     _with_auth(opts, url)
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = _run_ydl(opts, url, True)
 
     files = sorted(
-        (p for p in workdir.iterdir() if p.is_file()),
+        (p for p in workdir.iterdir() if p.is_file()
+         and not p.name.endswith((".part", ".ytdl", ".frag"))),
         key=lambda p: p.stat().st_mtime,
     )
     return files, (info or {})
@@ -538,7 +563,13 @@ async def process_download(message, url: str,
         if len(reason) > 250:
             reason = reason[:250] + "…"
         hint = ""
-        if "sign in" in reason.lower() or "login" in reason.lower():
+        low = reason.lower()
+        if "requested format" in low or "no video formats" in low:
+            hint = (
+                "\n\n💡 فرمتی از یوتیوب برنگشته — معمولاً یعنی کوکی منقضی شده. "
+                "یه کوکی تازه از مرورگر اکسپورت کن و COOKIES_CONTENT رو آپدیت کن."
+            )
+        elif "sign in" in low or "login" in low:
             hint = (
                 "\n\n💡 یوتیوب/اینستاگرام IP سرور رو بلاک کرده. "
                 "راه‌حل: کوکی مرورگرت رو در متغیر COOKIES_CONTENT یا COOKIES_B64 "
