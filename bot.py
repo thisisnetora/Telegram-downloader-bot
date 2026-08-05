@@ -369,13 +369,27 @@ YT_CLIENTS_COOKIE = ["web", "mweb", "web_safari"]
 # Without cookies there's no session to send; these cookieless clients are the
 # only chance of getting formats on a flagged IP.
 YT_CLIENTS_NOAUTH = ["android_vr", "android", "tv"]
+# bgutil PO-token provider (built into the Docker image): generates the tokens
+# YouTube's web clients demand, which is what unlocks the formats behind
+# "Requested format is not available". Optional — absent locally, it's skipped.
+BGUTIL_SERVER_HOME = os.environ.get(
+    "BGUTIL_SERVER_HOME", "/opt/bgutil-ytdlp-pot-provider/server"
+)
+
+
+def _yt_args(clients) -> dict:
+    args = {"youtube": {"player_client": clients}}
+    if Path(BGUTIL_SERVER_HOME, "build", "generate_once.js").exists():
+        args["youtubepot-bgutilscript"] = {"server_home": [BGUTIL_SERVER_HOME]}
+    return args
 
 
 def _with_auth(opts: dict, url: str = "") -> dict:
     has_cookies = Path(COOKIES_FILE).exists()
     if url and detect_platform(url) == "youtube":
-        clients = YT_CLIENTS_COOKIE if has_cookies else YT_CLIENTS_NOAUTH
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts["extractor_args"] = _yt_args(
+            YT_CLIENTS_COOKIE if has_cookies else YT_CLIENTS_NOAUTH
+        )
     if has_cookies:
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -415,7 +429,7 @@ def _run_ydl(opts: dict, url: str, dl: bool):
         last = exc
         for client in _client_order(has_cookies):
             retry = dict(opts)
-            retry["extractor_args"] = {"youtube": {"player_client": [client]}}
+            retry["extractor_args"] = _yt_args([client])
             try:
                 with yt_dlp.YoutubeDL(retry) as ydl:
                     info = ydl.extract_info(url, download=dl)
@@ -1033,7 +1047,12 @@ def main():
     )
     app.add_error_handler(on_error)
 
-    logger.info("Bot is starting... (yt-dlp %s)", yt_dlp.version.__version__)
+    logger.info(
+        "Bot is starting... (yt-dlp %s, PO-token provider: %s, cookies: %s)",
+        yt_dlp.version.__version__,
+        "✅" if Path(BGUTIL_SERVER_HOME, "build", "generate_once.js").exists() else "❌",
+        "✅" if Path(COOKIES_FILE).exists() else "❌",
+    )
     app.run_polling(drop_pending_updates=True)
 
 
