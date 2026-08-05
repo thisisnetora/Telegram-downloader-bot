@@ -62,12 +62,14 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
 # safest option: multiline env vars can get mangled by some dashboards.
 _cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
 _cookies_content = os.environ.get("COOKIES_CONTENT", "").strip()
-if _cookies_b64 and not Path(COOKIES_FILE).exists():
+# The env var is the source of truth — always (re)write so a stale cookies.txt
+# (e.g. one left on a persistent volume) never shadows fresh cookies.
+if _cookies_b64:
     try:
         Path(COOKIES_FILE).write_bytes(base64.b64decode(_cookies_b64, validate=True))
     except Exception:
         logger.exception("COOKIES_B64 is not valid base64")
-elif _cookies_content and not Path(COOKIES_FILE).exists():
+elif _cookies_content:
     # Some dashboards mangle multiline env vars into literal "\n" sequences.
     Path(COOKIES_FILE).write_text(
         _cookies_content.replace("\\n", "\n"), encoding="utf-8"
@@ -360,19 +362,21 @@ def make_progress_hook(loop, status_message, label: str):
     return hook
 
 
-# YouTube player clients that neither require PO tokens nor break when
-# cookies are attached: tv/web_embedded serve plain progressive formats,
-# web_safari adds token-free HLS variants. (web/mweb formats get PO-token
-# gated on datacenter IPs → "Requested format is not available".)
-YT_CLIENTS = ["tv", "web_embedded", "web_safari"]
-# Last resort for when stale cookies themselves break extraction.
+# When cookies exist, use the browser-matching clients — they're the only ones
+# that present cookies the way YouTube's "sign in to confirm you're not a bot"
+# check expects. web_safari also yields token-free HLS formats as a fallback.
+YT_CLIENTS_COOKIE = ["web", "mweb", "web_safari"]
+# Without cookies there's no session to send; these cookieless clients are the
+# only chance of getting formats on a flagged IP.
 YT_CLIENTS_NOAUTH = ["android_vr", "android", "tv"]
 
 
 def _with_auth(opts: dict, url: str = "") -> dict:
+    has_cookies = Path(COOKIES_FILE).exists()
     if url and detect_platform(url) == "youtube":
-        opts["extractor_args"] = {"youtube": {"player_client": YT_CLIENTS}}
-    if Path(COOKIES_FILE).exists():
+        clients = YT_CLIENTS_COOKIE if has_cookies else YT_CLIENTS_NOAUTH
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+    if has_cookies:
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
@@ -388,21 +392,39 @@ def _retryable_yt_error(exc: Exception) -> bool:
     ))
 
 
+def _client_order(has_cookies: bool) -> list:
+    # Browser clients first when logged in (cookies actually get sent); the
+    # cookieless clients are the only hope when there's no session.
+    return (["web", "mweb", "web_safari", "tv", "android_vr"] if has_cookies
+            else ["android_vr", "android", "tv", "web_safari", "web"])
+
+
 def _run_ydl(opts: dict, url: str, dl: bool):
-    """Run extract_info; on YouTube auth/format errors retry once without
-    cookies on the no-auth clients (stale cookies can be the problem)."""
+    """Run extract_info. A merged client list can hard-fail when one client gets
+    bot-checked, hiding formats another client would serve — so on a retryable
+    YouTube error, retry client-by-client (cookies preserved) and return the
+    first that works."""
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=dl)
     except Exception as exc:
         if detect_platform(url) != "youtube" or not _retryable_yt_error(exc):
             raise
-        logger.warning("YouTube failed (%s) — retrying without cookies", exc)
-        opts = dict(opts)
-        opts.pop("cookiefile", None)
-        opts["extractor_args"] = {"youtube": {"player_client": YT_CLIENTS_NOAUTH}}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=dl)
+        has_cookies = "cookiefile" in opts
+        logger.warning("YouTube primary attempt failed (%s) — trying clients one by one", exc)
+        last = exc
+        for client in _client_order(has_cookies):
+            retry = dict(opts)
+            retry["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with yt_dlp.YoutubeDL(retry) as ydl:
+                    info = ydl.extract_info(url, download=dl)
+                logger.info("YouTube client %s succeeded", client)
+                return info
+            except Exception as e2:
+                logger.warning("YouTube client %s failed: %s", client, e2)
+                last = e2
+        raise last
 
 
 def extract_metadata(url: str):
@@ -672,11 +694,12 @@ async def process_download(message, url: str,
                 "\n\n💡 فرمتی از یوتیوب برنگشته — معمولاً یعنی کوکی منقضی شده. "
                 "یه کوکی تازه از مرورگر اکسپورت کن و COOKIES_CONTENT رو آپدیت کن."
             )
-        elif "sign in" in low or "login" in low:
+        elif "sign in" in low or "login" in low or "not a bot" in low:
             hint = (
-                "\n\n💡 یوتیوب/اینستاگرام IP سرور رو بلاک کرده. "
-                "راه‌حل: کوکی مرورگرت رو در متغیر COOKIES_CONTENT یا COOKIES_B64 "
-                "ست کن (راهنما توی README)."
+                "\n\n💡 کوکی ست شده ولی یوتیوب قبولش نکرد — معمولاً یعنی **منقضی/باطل شده**. "
+                "یه بار Sign out/Sign in کن، بلافاصله کوکی تازه رو اکسپورت کن و "
+                "COOKIES_CONTENT رو آپدیت کن (بعد از اکسپورت، توی مرورگر روی یوتیوب "
+                "کلیک نکن که کوکی rotate می‌شه)."
             )
         elif "instagram" in url:
             hint = "\n\n💡 بعضی پست‌های اینستاگرام نیاز به لاگین دارن — کوکی لازمه."
