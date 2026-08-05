@@ -37,15 +37,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
 MAX_FILE_SIZE = 49 * 1024 * 1024  # Telegram Bot API upload limit is 50 MB
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
-# YouTube client spoofing order — some clients skip the bot-check on
-# datacenter IPs, some don't. Configurable because YouTube changes constantly.
-YOUTUBE_CLIENTS = [
-    c.strip()
-    for c in os.environ.get(
-        "YOUTUBE_CLIENTS", "android_vr,web_embedded,tv,web"
-    ).split(",")
-    if c.strip()
-]
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup.
@@ -123,7 +114,10 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.message:
         await update.message.reply_text(JOIN_REQUIRED, reply_markup=join_keyboard())
     elif update.callback_query:
-        await update.callback_query.answer("❌ اول عضو کانال شو!", show_alert=True)
+        try:
+            await update.callback_query.answer("❌ اول عضو کانال شو!", show_alert=True)
+        except Exception:
+            pass  # query may already have been answered
     return False
 
 WELCOME = """
@@ -245,8 +239,6 @@ def make_progress_hook(loop, status_message, state):
 def _cookies_opts(opts: dict) -> dict:
     if Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
-    if YOUTUBE_CLIENTS:
-        opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_CLIENTS}}
     return opts
 
 
@@ -283,7 +275,9 @@ def download(url: str, workdir: Path, status_message, loop,
     else:
         opts["noplaylist"] = False
         opts["playlistend"] = 10
-        opts["ignoreerrors"] = True
+        # Skip failed downloads inside carousels, but still surface
+        # extraction errors (login required, no video, ...) to the user.
+        opts["ignoreerrors"] = "only_download"
     if audio:
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
@@ -323,19 +317,29 @@ def fetch_og_image(url: str):
 
     resp = requests.get(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/124.0 Safari/537.36"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                          "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                          "Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
         timeout=20,
     )
     for pattern in (
         r'property="og:image"\s+content="([^"]+)"',
         r'content="([^"]+)"\s+property="og:image"',
         r'"image_xlarge_url"\s*:\s*"([^"]+)"',
+        r'"image_large_url"\s*:\s*"([^"]+)"',
+        r'"orig"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"',
     ):
         m = re.search(pattern, resp.text)
         if m:
-            return m.group(1).replace("&amp;", "&")
+            # Pinterest embeds image URLs as JSON — slashes come escaped.
+            return m.group(1).replace("\\/", "/").replace("&amp;", "&")
+    logger.warning(
+        "No image found in page %s (status %s, %d chars)",
+        url, resp.status_code, len(resp.text),
+    )
     return None
 
 
@@ -370,14 +374,25 @@ async def deliver(message, files: list[Path], caption: str = "",
             handles = [open(p, "rb") for p in batch]
             try:
                 await message.reply_media_group([InputMediaPhoto(h) for h in handles])
+            except Exception:
+                # Telegram photos must be JPEG/PNG — send webp etc. as files.
+                for h in handles:
+                    h.seek(0)
+                    await message.reply_document(h)
             finally:
                 for h in handles:
                     h.close()
         if caption:
             await message.reply_text(caption, parse_mode="HTML")
     elif images:
-        with open(images[0], "rb") as fh:
-            await message.reply_photo(fh, caption=caption, parse_mode="HTML")
+        img = images[0]
+        with open(img, "rb") as fh:
+            try:
+                await message.reply_photo(fh, caption=caption, parse_mode="HTML")
+            except Exception:
+                # Telegram photos must be JPEG/PNG — webp etc. go as documents.
+                fh.seek(0)
+                await message.reply_document(fh, caption=caption, parse_mode="HTML")
 
     for f in others:
         ext = f.suffix.lower()
@@ -394,6 +409,14 @@ async def deliver(message, files: list[Path], caption: str = "",
                 )
             else:
                 await message.reply_document(fh, caption=caption, parse_mode="HTML")
+
+
+async def reply_image(message, image_url: str, caption: str):
+    """Send an image by URL; fall back to a document if Telegram rejects it."""
+    try:
+        await message.reply_photo(image_url, caption=caption)
+    except Exception:
+        await message.reply_document(image_url, caption=caption)
 
 
 async def process_download(message, url: str,
@@ -421,9 +444,9 @@ async def process_download(message, url: str,
             if image_url:
                 await status.delete()
                 stats["total"] += 1
-                await message.reply_photo(
-                    image_url,
-                    caption=f"{emoji} {label}  •  🖼 عکس\n\n🤖 @{message.get_bot().username}",
+                await reply_image(
+                    message, image_url,
+                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 @{message.get_bot().username}",
                 )
                 return
             raise RuntimeError("nothing downloaded")
@@ -453,6 +476,19 @@ async def process_download(message, url: str,
 
     except Exception as exc:
         logger.exception("Download failed: %s", url)
+
+        # Image-only pins/posts raise "no video" errors — grab the image.
+        if "no video" in str(exc).lower():
+            image_url = await asyncio.to_thread(fetch_og_image, url)
+            if image_url:
+                await status.delete()
+                stats["total"] += 1
+                await reply_image(
+                    message, image_url,
+                    f"{emoji} {label}  •  🖼 عکس\n\n🤖 @{message.get_bot().username}",
+                )
+                return
+
         reason = re.sub(r"^ERROR:\s*", "", str(exc)).replace(url, "").strip()
         if len(reason) > 250:
             reason = reason[:250] + "…"
