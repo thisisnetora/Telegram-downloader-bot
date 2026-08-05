@@ -35,24 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")  # brand name shown in texts & captions
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
 # Official Bot API is capped at 50 MB. Point BOT_API_URL at a self-hosted
 # telegram-bot-api server (runs in --local mode) to raise it to ~2000 MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").strip().rstrip("/")
-if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
-    BOT_API_URL = "http://" + BOT_API_URL
-if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
-    BOT_API_URL = "http://" + BOT_API_URL
 if BOT_API_URL and not BOT_API_URL.startswith(("http://", "https://")):
     BOT_API_URL = f"http://{BOT_API_URL}"
 try:
@@ -60,8 +47,6 @@ try:
 except ValueError:
     MAX_FILE_SIZE = 49 * 1024 * 1024
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
-BOT_BRAND = os.environ.get("BOT_BRAND", "Netora")
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup. Base64 is the
@@ -70,11 +55,14 @@ _cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
 _cookies_content = os.environ.get("COOKIES_CONTENT", "").strip()
 if _cookies_b64 and not Path(COOKIES_FILE).exists():
     try:
-        Path(COOKIES_FILE).write_bytes(base64.b64decode(_b64))
+        Path(COOKIES_FILE).write_bytes(base64.b64decode(_cookies_b64, validate=True))
     except Exception:
         logger.exception("COOKIES_B64 is not valid base64")
 elif _cookies_content and not Path(COOKIES_FILE).exists():
-    Path(COOKIES_FILE).write_text(_cookies_content, encoding="utf-8")
+    # Some dashboards mangle multiline env vars into literal "\n" sequences.
+    Path(COOKIES_FILE).write_text(
+        _cookies_content.replace("\\n", "\n"), encoding="utf-8"
+    )
 
 if Path(COOKIES_FILE).exists():
     _lines = Path(COOKIES_FILE).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -163,19 +151,12 @@ WELCOME = f"""
 
 لینک بفرست، تحویل بگیر — همین‌قدر ساده ⚡
 
-📺 <b>یوتیوب</b>
-└ کیفیت ۱۰۸۰ تا ۳۶۰ + 🎧 MP3 با کارت اطلاعات ویدیو
+📺 <b>یوتیوب</b>  ·  کیفیت ۱۰۸۰ تا ۳۶۰ + 🎧 MP3
+📸 <b>اینستاگرام</b>  ·  ریلز، ویدیو و کاروسل
+🎵 <b>تیک‌تاک</b>  ·  ویدیو و آلبوم عکس
+📌 <b>پینترست</b>  ·  ویدیو و عکس HD
 
-📸 <b>اینستاگرام</b>
-└ ریلز، پست ویدیویی و کاروسل
-
-🎵 <b>تیک‌تاک</b>
-└ ویدیو و آلبوم عکس
-
-📌 <b>پینترست</b>
-└ ویدیو و عکس HD
-
-🚀 برای شروع، همین حالا یک لینک بفرست!
+🚀 همین حالا یک لینک بفرست!
 """
 
 HELP = """
@@ -186,13 +167,13 @@ HELP = """
 ۳. چند لحظه صبر کن تا فایل برسه ⏳
 
 ✨ <b>قابلیت‌ها:</b>
-• یوتیوب: کارت اطلاعات ویدیو + انتخاب کیفیت + MP3
-• تیک‌تاک و اینستا: دانلود خودکار، حتی پست‌های چندعکسی
-• نمایش عنوان، مدت و حجم فایل روی هر دانلود
+▫️ یوتیوب: کارت اطلاعات ویدیو + انتخاب کیفیت + MP3
+▫️ تیک‌تاک و اینستا: دانلود خودکار، حتی پست‌های چندعکسی
+▫️ نمایش عنوان، مدت و حجم فایل روی هر دانلود
 
 💡 <b>نکته‌ها:</b>
-• حداکثر حجم فایل: ۵۰ مگابایت (محدودیت تلگرام)
-• اگر ویدیوی یوتیوب حجیم بود، کیفیت پایین‌تر یا MP3 رو انتخاب کن
+▫️ حداکثر حجم فایل: ۵۰ مگابایت (محدودیت تلگرام)
+▫️ اگر ویدیوی یوتیوب حجیم بود، کیفیت پایین‌تر یا MP3 رو انتخاب کن
 """
 
 
@@ -240,17 +221,19 @@ def fmt_views(count) -> str:
 
 def progress_bar(pct: float) -> str:
     filled = min(10, int(pct // 10))
-    return "🟩" * filled + "⬜" * (10 - filled)
+    return "█" * filled + "░" * (10 - filled)
 
 
 async def safe_edit(message, text: str):
     try:
-        await message.edit_text(text)
+        await message.edit_text(text, parse_mode="HTML")
     except Exception:
         pass
 
 
-def make_progress_hook(loop, status_message, state):
+def make_progress_hook(loop, status_message, label: str):
+    state: dict = {}
+
     def hook(d):
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -262,7 +245,9 @@ def make_progress_hook(loop, status_message, state):
                     asyncio.run_coroutine_threadsafe(
                         safe_edit(
                             status_message,
-                            f"⬇️ در حال دانلود...\n{progress_bar(pct)} {pct:.0f}%",
+                            f"⬇️ در حال دانلود از <b>{label}</b>...\n\n"
+                            f"{progress_bar(pct)}  {fa(f'{pct:.0f}')}٪\n"
+                            f"📦 {fmt_size(downloaded)} از {fmt_size(total)}",
                         ),
                         loop,
                     )
@@ -274,26 +259,32 @@ def make_progress_hook(loop, status_message, state):
     return hook
 
 
-def _cookies_opts(opts: dict, url: str = "") -> dict:
-    # YouTube is fetched via android clients, which don't accept web cookies —
-    # mixing them makes YouTube withhold formats ("Requested format is not
-    # available"). Cookies stay for Instagram and friends.
-    if url and detect_platform(url) == "youtube":
-        return opts
+def _with_auth(opts: dict, url: str = "") -> dict:
+    """Attach cookies and pick YouTube player clients.
+
+    Cookies are the reliable way past YouTube's datacenter-IP blocks, but only
+    web clients accept them — android clients ignore cookies, and mixing the
+    two makes YouTube withhold formats. So with a cookies file we let yt-dlp
+    use its default (web) clients; without one we fall back to the android/tv
+    clients that sometimes still serve unauthenticated formats.
+    """
     if Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
+    elif url and detect_platform(url) == "youtube":
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["android_vr", "android", "tv"]}
+        }
     return opts
 
 
 def extract_metadata(url: str):
     """Fetch title/thumbnail/etc. without downloading anything."""
-    opts = _cookies_opts({
+    opts = _with_auth({
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": 20,
-        "extractor_args": {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
     }, url)
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -301,6 +292,7 @@ def extract_metadata(url: str):
 
 def download(url: str, workdir: Path, status_message, loop,
              quality: int | None = None, audio: bool = False) -> tuple[list[Path], dict]:
+    label = PLATFORM_META.get(detect_platform(url) or "", ("🔗", "لینک"))[1]
     opts = {
         "outtmpl": str(workdir / "%(title).100s-%(id)s.%(ext)s"),
         "quiet": True,
@@ -310,10 +302,7 @@ def download(url: str, workdir: Path, status_message, loop,
         "retries": 3,
         "writethumbnail": False,
         "writesubtitles": False,
-        "progress_hooks": [make_progress_hook(loop, status_message, {})],
-        # YouTube's default web client now returns PO-token-gated formats on
-        # datacenter IPs — these clients still serve plain downloadable ones.
-        "extractor_args": {"youtube": {"player_client": ["android_vr", "android", "tv"]}},
+        "progress_hooks": [make_progress_hook(loop, status_message, label)],
     }
     # A TikTok photo post or IG carousel IS a playlist — download all items.
     # For YouTube keep the single video only, even if the URL has &list=.
@@ -351,7 +340,7 @@ def download(url: str, workdir: Path, status_message, loop,
         )
         opts["merge_output_format"] = "mp4"
 
-    _cookies_opts(opts, url)
+    _with_auth(opts, url)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -411,7 +400,7 @@ def build_caption(info: dict, url: str, size: int, bot_username: str) -> str:
         parts.append(f"⏱ {fmt_duration(info['duration'])}")
     if size:
         parts.append(f"📦 {fmt_size(size)}")
-    lines.append("  •  ".join(parts))
+    lines.append("  │  ".join(parts))
     footer = f"🤖 @{bot_username}" if bot_username else ""
     if footer:
         lines.append(f"\n{footer}")
@@ -510,8 +499,9 @@ async def process_download(message, url: str,
         if not ok:
             await safe_edit(
                 status,
-                f"⚠️ حجم فایل {fmt_size(max(f.stat().st_size for f in files))}ه "
-                f"و از سقف مجاز ({fmt_size(MAX_FILE_SIZE)}) بیشتره.\n\n"
+                f"⚠️ <b>فایل خیلی حجیمه!</b>\n\n"
+                f"📦 حجم فایل: {fmt_size(max(f.stat().st_size for f in files))}\n"
+                f"🚧 سقف مجاز: {fmt_size(MAX_FILE_SIZE)}\n\n"
                 f"💡 برای یوتیوب: لینک رو دوباره بفرست و کیفیت پایین‌تر "
                 f"یا MP3 رو انتخاب کن.",
             )
@@ -551,15 +541,16 @@ async def process_download(message, url: str,
         if "sign in" in reason.lower() or "login" in reason.lower():
             hint = (
                 "\n\n💡 یوتیوب/اینستاگرام IP سرور رو بلاک کرده. "
-                "راه‌حل: فایل کوکی مرورگرت رو در متغیر COOKIES_CONTENT روی "
-                "Railway ست کن (راهنما توی README)."
+                "راه‌حل: کوکی مرورگرت رو در متغیر COOKIES_CONTENT یا COOKIES_B64 "
+                "ست کن (راهنما توی README)."
             )
         elif "instagram" in url:
             hint = "\n\n💡 بعضی پست‌های اینستاگرام نیاز به لاگین دارن — کوکی لازمه."
         await safe_edit(
             status,
-            f"❌ دانلود نشد.\n\n🛠 دلیل:\n{reason or 'خطای ناشناخته'}{hint}\n\n"
-            f"🔧 yt-dlp {yt_dlp.version.__version__} • "
+            f"❌ <b>دانلود نشد</b>\n\n"
+            f"🛠 <b>دلیل:</b>\n<code>{html.escape(reason) or 'خطای ناشناخته'}</code>{hint}\n\n"
+            f"🔧 yt-dlp {yt_dlp.version.__version__}  •  "
             f"کوکی: {'✅' if Path(COOKIES_FILE).exists() else '❌'}",
         )
     finally:
@@ -605,6 +596,7 @@ def youtube_keyboard(token: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🎬 ۳۶۰", callback_data=f"yt:360:{token}"),
         ],
         [InlineKeyboardButton("🎧 MP3 — فقط صوت", callback_data=f"yt:mp3:{token}")],
+        [InlineKeyboardButton("❌ لغو", callback_data=f"yt:cancel:{token}")],
     ])
 
 
@@ -620,9 +612,12 @@ async def send_youtube_card(message, url: str):
         # Metadata is a bonus — if it's blocked, still offer the buttons.
         await safe_edit(
             status,
-            "🎬 لینک یوتیوب دریافت شد!\n\n👇 کیفیت موردنظرت رو انتخاب کن:",
+            "🎬 <b>لینک یوتیوب دریافت شد!</b>\n\n👇 کیفیت موردنظرت رو انتخاب کن:",
         )
-        await status.edit_reply_markup(reply_markup=keyboard)
+        try:
+            await status.edit_reply_markup(reply_markup=keyboard)
+        except Exception:
+            pass
         return
 
     title = html.escape((info.get("title") or "ویدیوی یوتیوب")[:150])
@@ -659,6 +654,14 @@ async def on_quality(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         _, q, token = query.data.split(":")
     except ValueError:
+        return
+
+    if q == "cancel":
+        pending.pop(token, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
     url = pending.pop(token, None)
