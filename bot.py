@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BOT_BRAND = os.environ.get("BOT_BRAND", "Netora").strip() or "Netora"
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()  # e.g. @mychannel
+# Telegram wants @username or a numeric -100... id — normalize a bare username.
+if (FORCE_JOIN_CHANNEL
+        and not FORCE_JOIN_CHANNEL.startswith("@")
+        and not FORCE_JOIN_CHANNEL.lstrip("-").isdigit()):
+    FORCE_JOIN_CHANNEL = "@" + FORCE_JOIN_CHANNEL
 # Official Bot API is capped at 50 MB. Point BOT_API_URL at a self-hosted
 # telegram-bot-api server (runs in --local mode) to raise it to ~2000 MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").strip().rstrip("/")
@@ -127,11 +132,15 @@ async def is_member(bot, user_id: int) -> bool:
             and getattr(member, "is_member", False)
         )
     except Exception as exc:
+        # Telegram raises "user not found" for people who are NOT members —
+        # that IS the not-a-member signal, so block them.
+        if "user not found" in str(exc).lower() or "participant_id_invalid" in str(exc).lower():
+            return False
         logger.warning(
             "Membership check failed (%s). Is the bot an admin in %s?",
             exc, FORCE_JOIN_CHANNEL,
         )
-        return True  # fail open so a misconfigured channel doesn't break the bot
+        return True  # fail open on API/misconfig errors (see validate_force_join)
 
 
 async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -144,10 +153,16 @@ async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.callback_query.answer("❌ اول عضو کانال شو!", show_alert=True)
         except Exception:
             pass  # query may already have been answered
+        try:
+            await update.callback_query.message.reply_text(
+                JOIN_REQUIRED, reply_markup=join_keyboard()
+            )
+        except Exception:
+            pass
     return False
 
-WELCOME = f"""
-✨ <b>به {BOT_BRAND} خوش اومدی!</b>
+WELCOME = """
+✨ <b>به Netora Downloader خوش اومدی!</b>
 
 لینک بفرست، تحویل بگیر — همین‌قدر ساده ⚡
 
@@ -170,10 +185,6 @@ HELP = """
 ▫️ یوتیوب: کارت اطلاعات ویدیو + انتخاب کیفیت + MP3
 ▫️ تیک‌تاک و اینستا: دانلود خودکار، حتی پست‌های چندعکسی
 ▫️ نمایش عنوان، مدت و حجم فایل روی هر دانلود
-
-💡 <b>نکته‌ها:</b>
-▫️ حداکثر حجم فایل: ۵۰ مگابایت (محدودیت تلگرام)
-▫️ اگر ویدیوی یوتیوب حجیم بود، کیفیت پایین‌تر یا MP3 رو انتخاب کن
 """
 
 
@@ -728,6 +739,31 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error", exc_info=context.error)
 
 
+async def validate_force_join(app: Application):
+    """Surface force-join misconfig loudly at startup instead of the
+    membership check silently failing open for everyone."""
+    if not FORCE_JOIN_CHANNEL:
+        return
+    try:
+        await app.bot.get_chat(FORCE_JOIN_CHANNEL)
+        me = await app.bot.get_chat_member(FORCE_JOIN_CHANNEL, app.bot.id)
+        if me.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            logger.error(
+                "FORCE JOIN: the bot is NOT an admin in %s — membership checks "
+                "will silently PASS for everyone! Add the bot as an admin.",
+                FORCE_JOIN_CHANNEL,
+            )
+        else:
+            logger.info("Force-join verified — bot is admin in %s", FORCE_JOIN_CHANNEL)
+    except Exception as exc:
+        logger.error(
+            "FORCE JOIN: cannot access %s (%s) — membership checks will "
+            "silently PASS for everyone! Fix: the bot must be an ADMIN in the "
+            "channel and FORCE_JOIN_CHANNEL must be @username or a numeric id.",
+            FORCE_JOIN_CHANNEL, exc,
+        )
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ متغیر محیطی BOT_TOKEN تنظیم نشده!")
@@ -745,6 +781,7 @@ def main():
         logger.info("Using local Bot API server at %s (max upload %d MB)",
                     BOT_API_URL, MAX_FILE_SIZE // 1024 // 1024)
     app = builder.build()
+    app.post_init = validate_force_join
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^yt:"))
