@@ -7,6 +7,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import socket
@@ -60,6 +61,18 @@ try:
 except ValueError:
     MAX_FILE_SIZE = 49 * 1024 * 1024
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+# YouTube blocks datacenter IPs regardless of client/library — route YouTube
+# traffic (extraction, media download AND PO-token minting) through another IP.
+# Comma-separated list; one is picked at random per download.
+YOUTUBE_PROXIES = [
+    p.strip() for p in os.environ.get("YOUTUBE_PROXY", "").split(",") if p.strip()
+]
+
+
+def _pick_yt_proxy():
+    # One pick per download keeps metadata, PO token and the stream itself on the
+    # SAME exit IP — YouTube binds PO tokens and googlevideo URLs to the requester's IP.
+    return random.choice(YOUTUBE_PROXIES) if YOUTUBE_PROXIES else None
 
 # On hosts like Railway you can't upload files easily — pass cookies as an
 # env var instead and we materialize the file at startup. Base64 is the
@@ -470,9 +483,16 @@ def _pot_self_test() -> None:
         logger.error("bgutil /ping failed: %s", exc)
         return
     try:
+        payload = {"content_binding": "dQw4w9WgXcQ"}
+        proxy = _pick_yt_proxy()
+        if proxy:
+            # Mint through the same exit IP real downloads will use — PO tokens
+            # are IP-bound, so a token minted via Railway's IP is useless when
+            # the video requests go through a proxy.
+            payload["proxy"] = proxy
         req = urllib.request.Request(
             f"{POT_BASE_URL}/get_pot",
-            data=json.dumps({"content_binding": "dQw4w9WgXcQ"}).encode(),
+            data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=90) as resp:
@@ -519,6 +539,11 @@ def _with_auth(opts: dict, url: str = "") -> dict:
         # URL" is also a warning. no_warnings=True hides exactly the lines that
         # explain a "Requested format is not available" failure.
         opts["no_warnings"] = False
+        proxy = _pick_yt_proxy()
+        if proxy:
+            # The bgutil plugin forwards this proxy to /get_pot, so the PO token
+            # is minted from the same IP the download requests come from.
+            opts["proxy"] = proxy
     if has_cookies:
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -559,6 +584,11 @@ def _run_ydl(opts: dict, url: str, dl: bool):
         for client in _client_order(has_cookies):
             retry = dict(opts)
             retry["extractor_args"] = _yt_args([client])
+            # Rotate the exit IP per attempt too — a dead proxy would otherwise
+            # sink every client retry of this download.
+            proxy = _pick_yt_proxy()
+            if proxy:
+                retry["proxy"] = proxy
             try:
                 with yt_dlp.YoutubeDL(retry) as ydl:
                     info = ydl.extract_info(url, download=dl)
@@ -1189,10 +1219,11 @@ def main():
     app.add_error_handler(on_error)
 
     logger.info(
-        "Bot is starting... (yt-dlp %s, PO-token provider: %s, cookies: %s)",
+        "Bot is starting... (yt-dlp %s, PO-token provider: %s, cookies: %s, YT proxies: %s)",
         yt_dlp.version.__version__,
         "✅" if pot_ok() else "❌",
         "✅" if Path(COOKIES_FILE).exists() else "❌",
+        len(YOUTUBE_PROXIES) or "❌",
     )
     app.run_polling(drop_pending_updates=True)
 
