@@ -379,16 +379,13 @@ def make_progress_hook(loop, status_message, label: str):
     return hook
 
 
-# Verified against live YouTube (2026-08): the WEBPO clients below BOTH accept a
-# bgutil PO token (required to get any format on a datacenter IP) AND are not
-# subject to YouTube's SABR-only experiment, so they still return direct format
-# URLs. web/mweb/web_safari/web_embedded are SABR-only now — yt-dlp skips their
-# URL-less formats, which is exactly the "Requested format is not available"
-# error, even with a valid PO token. So they are useless and no longer tried.
-YT_CLIENTS_POT = ["tvhtml5", "web_remix", "tvhtml5_simply"]
-# Cookieless clients that return direct URLs without a PO token — the fallback
-# when the POT server isn't running (e.g. local dev) or the IP isn't flagged.
-YT_CLIENTS_NOAUTH = ["android_vr", "android_testsuite", "android_producer"]
+# Clients for the per-client retry loop. yt-dlp 2026.07 dropped support for
+# tvhtml5/web_remix/tvhtml5_simply/android_testsuite/android_producer entirely
+# ("Skipping unsupported client" warnings) — only these are still maintained.
+# tv & web_safari accept a bgutil PO token; android_vr is the cookieless
+# fallback (yt-dlp auto-skips it when cookies are configured).
+YT_CLIENTS_POT = ["tv", "web_safari"]
+YT_CLIENTS_NOAUTH = ["android_vr"]
 # bgutil PO-token provider (built into the Docker image): generates the tokens
 # YouTube's web clients demand, which is what unlocks the formats behind
 # "Requested format is not available". We run it as an in-process HTTP server
@@ -520,8 +517,10 @@ def _stop_pot_server() -> None:
 atexit.register(_stop_pot_server)
 
 
-def _yt_args(clients) -> dict:
-    args = {"youtube": {"player_client": clients}}
+def _yt_args(clients=None) -> dict:
+    args = {"youtube": {}}
+    if clients:
+        args["youtube"]["player_client"] = clients
     if pot_ok():
         args["youtubepot-bgutilhttp"] = {"base_url": [POT_BASE_URL]}
     return args
@@ -530,10 +529,17 @@ def _yt_args(clients) -> dict:
 def _with_auth(opts: dict, url: str = "") -> dict:
     has_cookies = Path(COOKIES_FILE).exists()
     if url and detect_platform(url) == "youtube":
-        opts["extractor_args"] = _yt_args(YT_CLIENTS_POT)
-        # The n/sig challenge needs a JS runtime. yt-dlp defaults to deno only,
-        # so enable node (>= v22) too as a fallback.
+        # Don't pin player_client on the primary attempt — yt-dlp's built-in
+        # default set is maintained as YouTube retires clients, while a
+        # hardcoded list goes stale (tvhtml5 & co. are already dropped).
+        # The per-client retry loop pins them one by one.
+        opts["extractor_args"] = _yt_args()
+        # Solving YouTube's n/sig JS challenge needs BOTH a runtime (deno is
+        # installed; node >= v22 as fallback) AND the EJS solver script — a
+        # "remote component" that must be explicitly allowed. Without it every
+        # format comes back URL-less ("Only images are available for download").
         opts.setdefault("js_runtimes", {"deno": {}, "node": {}})
+        opts["remote_components"] = ["ejs:github"]
         # Keep yt-dlp warnings visible for YouTube — the bgutil plugin reports
         # PO-token fetch failures as warnings, and "skipping SABR format without
         # URL" is also a warning. no_warnings=True hides exactly the lines that
