@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -431,6 +432,7 @@ def start_pot_server() -> None:
         if _pot_reachable():
             _pot_ready = True
             logger.info("bgutil POT server up on %s (pid %s)", POT_BASE_URL, _pot_proc.pid)
+            threading.Thread(target=_pot_self_test, daemon=True).start()
             return
         if _pot_proc.poll() is not None:
             logger.error(
@@ -452,6 +454,37 @@ def _pot_reachable() -> bool:
             return True
     except OSError:
         return False
+
+
+def _pot_self_test() -> None:
+    """Ask the server for a real PO token. The TCP check only proves the port is
+    open — this proves token generation actually works end to end (and warms the
+    minter cache so the first real download isn't the slow one)."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{POT_BASE_URL}/ping", timeout=10) as resp:
+            logger.info("bgutil /ping: %s", resp.read().decode(errors="replace")[:300])
+    except Exception as exc:
+        logger.error("bgutil /ping failed: %s", exc)
+        return
+    try:
+        req = urllib.request.Request(
+            f"{POT_BASE_URL}/get_pot",
+            data=json.dumps({"content_binding": "dQw4w9WgXcQ"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            logger.info("bgutil POT self-test OK (HTTP %s) — token generation works", resp.status)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")[:500]
+        logger.error(
+            "bgutil POT self-test FAILED (HTTP %s): %s\nServer log:\n%s",
+            exc.code, body, _pot_log_tail() or "(empty)",
+        )
+    except Exception as exc:
+        logger.error("bgutil POT self-test FAILED: %s", exc)
 
 
 def pot_ok() -> bool:
@@ -481,6 +514,11 @@ def _with_auth(opts: dict, url: str = "") -> dict:
         # The n/sig challenge needs a JS runtime. yt-dlp defaults to deno only,
         # so enable node (>= v22) too as a fallback.
         opts.setdefault("js_runtimes", {"deno": {}, "node": {}})
+        # Keep yt-dlp warnings visible for YouTube — the bgutil plugin reports
+        # PO-token fetch failures as warnings, and "skipping SABR format without
+        # URL" is also a warning. no_warnings=True hides exactly the lines that
+        # explain a "Requested format is not available" failure.
+        opts["no_warnings"] = False
     if has_cookies:
         opts["cookiefile"] = COOKIES_FILE
     return opts
@@ -529,6 +567,12 @@ def _run_ydl(opts: dict, url: str, dl: bool):
             except Exception as e2:
                 logger.warning("YouTube client %s failed: %s", client, e2)
                 last = e2
+        # Surface the POT server's own log — if /get_pot is 500ing, the stack
+        # trace lives there, not in yt-dlp's output.
+        logger.error(
+            "All YouTube clients failed for %s. bgutil server log tail:\n%s",
+            url, _pot_log_tail() or "(empty)",
+        )
         raise last
 
 
