@@ -3,7 +3,7 @@
 # "Requested format is not available" on datacenter IPs). This provider
 # generates them. Built in a separate stage so the compile toolchain
 # (canvas' native build) never bloats the final image.
-FROM node:20-bookworm AS bgutil-builder
+FROM node:22-bookworm AS bgutil-builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential pkg-config python3 \
@@ -21,7 +21,10 @@ RUN curl -fsSL https://codeload.github.com/Brainicism/bgutil-ytdlp-pot-provider/
     && npm cache clean --force
 
 # ---- Stage 2: the bot -------------------------------------------------------
-FROM python:3.12-slim
+# Pinned to bookworm: the bgutil-builder stage above compiles canvas' native
+# module against bookworm's glibc/system libs — running it on a different Debian
+# release (python:3.12-slim moved to trixie) makes the POT server crash at boot.
+FROM python:3.12-slim-bookworm
 
 # ffmpeg: merge/convert media — deno: JS runtime yt-dlp needs for full YouTube
 # format extraction. node + canvas runtime libs: run the PO-token generator.
@@ -32,7 +35,7 @@ RUN apt-get update \
     && curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
     && unzip /tmp/deno.zip -d /usr/local/bin \
     && rm /tmp/deno.zip \
-    && curl -fsSL https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-x64.tar.gz -o /tmp/node.tar.gz \
+    && curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz -o /tmp/node.tar.gz \
     && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
     && rm /tmp/node.tar.gz \
     && rm -rf /var/lib/apt/lists/*
